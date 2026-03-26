@@ -59,10 +59,14 @@ public class ActualsService {
         Property property = propertyRepository.findById(propertyId)
                 .orElseThrow(() -> new EntityNotFoundException("Property not found: " + propertyId));
         List<ParsedActualsRow> rows = actualsExcelParser.parse(file.getInputStream());
+        Map<String, String> coaNameByCode = coaRepository
+                .findByProperty_IdAndOrganizationIdOrderByCoaCodeAsc(propertyId, organizationId)
+                .stream()
+                .collect(Collectors.toMap(Coa::getCoaCode, Coa::getCoaName, (a, b) -> a));
         Set<String> unknownCoa = new LinkedHashSet<>();
         for (ParsedActualsRow r : rows) {
             String code = r.coaCode();
-            if (!coaRepository.existsByCoaCodeAndProperty_IdAndOrganizationId(code, propertyId, organizationId)) {
+            if (!coaNameByCode.containsKey(code)) {
                 unknownCoa.add(code);
             }
         }
@@ -86,6 +90,8 @@ public class ActualsService {
                 inserted++;
             }
             e.setCoaCode(r.coaCode());
+            String resolvedCoaName = coaNameByCode.getOrDefault(r.coaCode(), r.coaName());
+            e.setCoaName(resolvedCoaName == null ? null : resolvedCoaName.trim());
             e.setYear(year);
             e.setProperty(property);
             e.setOrganizationId(organizationId);
@@ -110,7 +116,10 @@ public class ActualsService {
     }
 
     private ActualsDetailDto toDto(ActualsDetails e, Map<String, String> coaNameByCode) {
-        String coaName = coaNameByCode.getOrDefault(e.getCoaCode(), "");
+        String coaName = e.getCoaName();
+        if (coaName == null || coaName.isBlank()) {
+            coaName = coaNameByCode.getOrDefault(e.getCoaCode(), "");
+        }
         return new ActualsDetailDto(
                 e.getId(),
                 e.getCoaCode(),

@@ -1,6 +1,7 @@
 package com.planora.web;
 
 import com.planora.service.PlanService;
+import com.planora.web.dto.CreatePlanRequest;
 import com.planora.web.dto.LineItemDto;
 import com.planora.web.dto.PlanSummaryDto;
 import com.planora.web.dto.RegenerateDailyDetailsResponse;
@@ -11,6 +12,8 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -28,6 +31,17 @@ public class PlanController {
     @GetMapping
     public List<PlanSummaryDto> listPlans(@RequestParam(required = false) Long propertyId) {
         return planService.listPlans(propertyId);
+    }
+
+    @PostMapping
+    public ResponseEntity<PlanSummaryDto> createPlan(@Valid @RequestBody CreatePlanRequest body) {
+        return ResponseEntity.ok(planService.createPlan(body));
+    }
+
+    @DeleteMapping("/{planId}")
+    public ResponseEntity<Void> deletePlan(@PathVariable Long planId) {
+        planService.softDeletePlan(planId);
+        return ResponseEntity.noContent().build();
     }
 
     @GetMapping("/{planId}/line-items")

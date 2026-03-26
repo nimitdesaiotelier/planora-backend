@@ -39,7 +39,7 @@ public class ActualsController {
         return actualsService.list(year, propertyId, organizationId);
     }
 
-    /** Same workbook layout as upload — no rows yet yields headers only; re-import after export upserts by COA code. */
+    /** Same workbook layout as upload — A: coaCode, B: coaName, C-N: Jan-Dec, O+: daily values. */
     @GetMapping("/export")
     public ResponseEntity<byte[]> export(
             @RequestParam int year,

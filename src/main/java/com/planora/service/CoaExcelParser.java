@@ -10,10 +10,15 @@ import java.util.ArrayList;
 import java.util.List;
 import org.apache.poi.ss.usermodel.Cell;
 import org.apache.poi.ss.usermodel.CellType;
+import org.apache.poi.ss.usermodel.DataValidation;
+import org.apache.poi.ss.usermodel.DataValidationConstraint;
+import org.apache.poi.ss.usermodel.DataValidationHelper;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.ss.usermodel.WorkbookFactory;
+import org.apache.poi.ss.util.CellRangeAddressList;
+import org.apache.poi.xssf.usermodel.XSSFDataValidation;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.springframework.stereotype.Component;
 
@@ -33,6 +38,7 @@ public class CoaExcelParser {
     private static final int COL_NAME = 1;
     private static final int COL_DEPT = 2;
     private static final int COL_TYPE = 3;
+    private static final int VALIDATION_MAX_ROW = 5000;
 
     public record ParsedRow(String coaCode, String coaName, String department, LineItemType lineItemType) {}
 
@@ -98,6 +104,7 @@ public class CoaExcelParser {
             h.createCell(COL_NAME).setCellValue("coaName");
             h.createCell(COL_DEPT).setCellValue("department");
             h.createCell(COL_TYPE).setCellValue("lineItemType");
+            addLineItemTypeDropdown(sheet);
             int r = 1;
             for (Coa c : rows) {
                 writeDataRow(sheet, r++, c.getCoaCode(), c.getCoaName(), c.getDepartment(), c.getLineItemType().name());
@@ -115,6 +122,25 @@ public class CoaExcelParser {
         row.createCell(COL_NAME).setCellValue(name);
         row.createCell(COL_DEPT).setCellValue(dept);
         row.createCell(COL_TYPE).setCellValue(type);
+    }
+
+    private static void addLineItemTypeDropdown(Sheet sheet) {
+        DataValidationHelper helper = sheet.getDataValidationHelper();
+        String[] allowedTypes = java.util.Arrays.stream(LineItemType.values())
+                .map(LineItemType::name)
+                .toArray(String[]::new);
+        DataValidationConstraint constraint = helper.createExplicitListConstraint(allowedTypes);
+        CellRangeAddressList addressList = new CellRangeAddressList(1, VALIDATION_MAX_ROW, COL_TYPE, COL_TYPE);
+        DataValidation validation = helper.createValidation(constraint, addressList);
+        if (validation instanceof XSSFDataValidation) {
+            // XSSF requires suppressDropDownArrow=true for the in-cell dropdown to show reliably.
+            validation.setSuppressDropDownArrow(true);
+        } else {
+            validation.setSuppressDropDownArrow(false);
+        }
+        validation.setShowErrorBox(true);
+        validation.createErrorBox("Invalid lineItemType", "Please select a value from the dropdown list.");
+        sheet.addValidationData(validation);
     }
 
     private static byte[] toBytes(XSSFWorkbook wb) throws IOException {

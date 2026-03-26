@@ -3,6 +3,7 @@ package com.planora.service;
 import com.planora.domain.ActualsDetails;
 import com.planora.domain.Plan;
 import com.planora.domain.PlanMonthlyDetails;
+import com.planora.enums.PlanStatus;
 import com.planora.domain.Property;
 import com.planora.enums.PlanType;
 import com.planora.repo.ActualsDetailRepository;
@@ -108,8 +109,8 @@ public class SourceDataResolverService {
     // ─── Plan data (tbl_plan_monthly_details) ────────────────────────────
 
     private SourceLookupResult resolvePlanData(int year, Property property, PlanType planType, String lineKey) {
-        Optional<Plan> sourcePlan = planRepository.findFirstByProperty_IdAndFiscalYearAndPlanTypeOrderByIdAsc(
-                property.getId(), year, planType);
+        Optional<Plan> sourcePlan = planRepository.findFirstByProperty_IdAndFiscalYearAndPlanTypeAndStatusOrderByIdAsc(
+                property.getId(), year, planType, PlanStatus.ACTIVE);
         if (sourcePlan.isEmpty()) {
             return SourceLookupResult.unavailable(
                     "%s plan data is not available for %s FY %d."

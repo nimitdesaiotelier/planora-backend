@@ -44,7 +44,16 @@ public class PlanMonthlyDetails {
     @JoinColumn(name = "plan_id", nullable = false)
     private Plan plan;
 
-    @Column(name = "line_key", nullable = false, length = 64)
+    @Column(name = "coa_id")
+    private Long coaId;
+
+    @Column(name = "coa_code", length = 128)
+    private String coaCode;
+
+    @Column(name = "coa_name", length = 512)
+    private String coaName;
+
+    @Column(name = "line_key", nullable = false, length = 128)
     private String lineKey;
 
     @Column(nullable = false, length = 128)
