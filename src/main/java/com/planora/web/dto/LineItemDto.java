@@ -5,6 +5,8 @@ import java.util.Map;
 
 public record LineItemDto(
         String id,
+        String coaCode,
+        String coaName,
         String lineKey,
         String department,
         String type,

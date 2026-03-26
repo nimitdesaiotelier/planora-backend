@@ -1,12 +1,18 @@
 package com.planora.service;
 
 import com.planora.domain.ActualsDetails;
-import com.planora.domain.PlanMonthlyDetails;
-import com.planora.enums.LineItemType;
+import com.planora.domain.Coa;
 import com.planora.domain.Plan;
+import com.planora.domain.PlanMonthlyDetails;
+import com.planora.domain.Property;
+import com.planora.enums.LineItemType;
+import com.planora.enums.PlanStatus;
 import com.planora.repo.ActualsDetailRepository;
+import com.planora.repo.CoaRepository;
 import com.planora.repo.LineItemRepository;
 import com.planora.repo.PlanRepository;
+import com.planora.repo.PropertyRepository;
+import com.planora.web.dto.CreatePlanRequest;
 import com.planora.web.dto.LineItemDto;
 import com.planora.web.dto.PlanSummaryDto;
 import com.planora.web.dto.UpdateLineItemValuesRequest;
@@ -30,21 +36,65 @@ public class PlanService {
     private final PlanRepository planRepository;
     private final LineItemRepository lineItemRepository;
     private final ActualsDetailRepository actualsDetailRepository;
+    private final CoaRepository coaRepository;
+    private final PropertyRepository propertyRepository;
 
     @Transactional(readOnly = true)
     public List<PlanSummaryDto> listPlans(Long propertyId) {
         List<Plan> plans = propertyId == null
-                ? planRepository.findAll()
-                : planRepository.findByProperty_IdOrderByIdAsc(propertyId);
+                ? planRepository.findByStatusOrderByIdAsc(PlanStatus.ACTIVE)
+                : planRepository.findByProperty_IdAndStatusOrderByIdAsc(propertyId, PlanStatus.ACTIVE);
         return plans.stream()
                 .map(this::toSummary)
                 .sorted((a, b) -> Long.compare(a.id(), b.id()))
                 .toList();
     }
 
+    @Transactional
+    public PlanSummaryDto createPlan(CreatePlanRequest req) {
+        long organizationId = req.organizationId() == null ? DEFAULT_ORG_ID : req.organizationId();
+        Property property = propertyRepository.findById(req.propertyId())
+                .orElseThrow(() -> new EntityNotFoundException("Property not found: " + req.propertyId()));
+
+        Plan p = new Plan();
+        p.setName("%s FY %d - %s".formatted(
+                req.planType().name(), req.fiscalYear(), property.getName()));
+        p.setPlanType(req.planType());
+        p.setFiscalYear(req.fiscalYear());
+        p.setProperty(property);
+        p.setStatus(PlanStatus.ACTIVE);
+
+        List<Coa> coas = coaRepository.findByProperty_IdAndOrganizationIdOrderByCoaCodeAsc(
+                req.propertyId(), organizationId);
+        for (Coa coa : coas) {
+            PlanMonthlyDetails item = new PlanMonthlyDetails();
+            item.setPlan(p);
+            item.setCoaId(coa.getId());
+            item.setCoaCode(coa.getCoaCode());
+            item.setCoaName(coa.getCoaName());
+            item.setLineKey(coa.getCoaCode());
+            item.setDepartment(coa.getDepartment());
+            item.setType(coa.getLineItemType());
+            item.setCategory(coa.getLineItemType().name());
+            item.setLabel(coa.getCoaName());
+            p.getLineItems().add(item);
+        }
+        Plan saved = planRepository.save(p);
+        return toSummary(saved);
+    }
+
+    @Transactional
+    public void softDeletePlan(Long planId) {
+        Plan plan = planRepository.findByIdAndStatus(planId, PlanStatus.ACTIVE)
+                .orElseThrow(() -> new EntityNotFoundException("Plan not found: " + planId));
+        plan.setStatus(PlanStatus.DELETED);
+        planRepository.save(plan);
+    }
+
     @Transactional(readOnly = true)
     public List<LineItemDto> listLineItems(Long planId) {
-        Plan plan = planRepository.findById(planId).orElseThrow(() -> new EntityNotFoundException("Plan not found: " + planId));
+        Plan plan = planRepository.findByIdAndStatus(planId, PlanStatus.ACTIVE)
+                .orElseThrow(() -> new EntityNotFoundException("Plan not found: " + planId));
 
         Map<String, ActualsDetails> actualsByCoa = actualsDetailRepository
                 .findByYearAndProperty_IdAndOrganizationIdOrderByCoaCodeAsc(
@@ -62,7 +112,8 @@ public class PlanService {
 
     @Transactional
     public LineItemDto updateLineItemValues(Long planId, Long lineItemId, UpdateLineItemValuesRequest body) {
-        Plan plan = planRepository.findById(planId).orElseThrow(() -> new EntityNotFoundException("Plan not found: " + planId));
+        Plan plan = planRepository.findByIdAndStatus(planId, PlanStatus.ACTIVE)
+                .orElseThrow(() -> new EntityNotFoundException("Plan not found: " + planId));
         PlanMonthlyDetails item = lineItemRepository
                 .findByIdAndPlan_Id(lineItemId, planId)
                 .orElseThrow(() -> new EntityNotFoundException(
@@ -103,6 +154,8 @@ public class PlanService {
                 : new LinkedHashMap<>(li.getDailyDetails());
         return new LineItemDto(
                 String.valueOf(li.getId()),
+                li.getCoaCode() == null || li.getCoaCode().isBlank() ? li.getLineKey() : li.getCoaCode(),
+                li.getCoaName() == null || li.getCoaName().isBlank() ? li.getLabel() : li.getCoaName(),
                 li.getLineKey(),
                 li.getDepartment(),
                 li.getType().name(),
