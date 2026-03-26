@@ -10,5 +10,7 @@ public record ParsedInstructionDto(
         String summary,
         /** One entry per distinct change (e.g. Jan +$2000 and Feb +10% → two objects) */
         List<InstructionStepDto> instructions,
+        /** Non-fatal issues while applying instruction (e.g. missing source-year actuals) */
+        List<String> warnings,
         /** Month totals after applying every step in order */
         Map<String, Integer> newValues) {}
