@@ -1,13 +1,13 @@
 package com.planora.service;
 
-import com.planora.enums.PlanType;
-
+import com.planora.web.dto.InstructionStepDto;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Applies parsed AI intent to monthly plan values (same rules as the former frontend {@code applyTransformation}).
+ * Pure-function service: applies a single parsed instruction step to month values.
+ * No DB access — all source data is passed in by the caller.
  */
 public final class BudgetInstructionApplyService {
 
@@ -23,45 +23,56 @@ public final class BudgetInstructionApplyService {
     private BudgetInstructionApplyService() {}
 
     /**
-     * @param priorYearBudgetMonths monthly values from prior FY {@link PlanType#BUDGET} (same property,
-     *                              same line); used only for {@code copy}+{@code ly_actual}
+     * Apply a single instruction step.
+     *
+     * @param currentValues    current Jan–Dec month totals
+     * @param sourceMonths     resolved source data for copy operations (empty map if not a copy or unavailable)
+     * @param step             the parsed instruction step
+     * @return new month values after applying the step
      */
     public static Map<String, Integer> apply(
             Map<String, Integer> currentValues,
-            Map<String, Integer> priorYearBudgetMonths,
-            String action,
-            String type,
-            String period,
-            Double value) {
+            Map<String, Integer> sourceMonths,
+            InstructionStepDto step) {
+
         Map<String, Integer> base = new LinkedHashMap<>();
         for (String m : MONTHS) {
             base.put(m, currentValues != null ? currentValues.getOrDefault(m, 0) : 0);
         }
-        List<String> affected = affectedMonths(period);
-        String act = action == null ? "" : action.toLowerCase();
-        String typ = type == null ? "" : type.toLowerCase();
+
+        String action = step.action() == null ? "" : step.action().toLowerCase();
+        Double value = toDouble(step.value());
+        List<String> affected = affectedMonths(step.period());
 
         for (String month : affected) {
             int current = base.getOrDefault(month, 0);
-            if ("copy".equals(act) && "ly_actual".equals(typ)) {
-                int av = priorYearBudgetMonths != null ? priorYearBudgetMonths.getOrDefault(month, 0) : 0;
-                base.put(month, av);
-            } else if ("increase".equals(act)) {
-                if ("percentage".equals(typ) && value != null) {
-                    base.put(month, (int) Math.round(current * (1 + value / 100.0)));
-                } else if ("absolute".equals(typ) && value != null) {
-                    base.put(month, (int) Math.round(current + value));
+
+            switch (action) {
+                case "copy" -> {
+                    if (sourceMonths != null && !sourceMonths.isEmpty()) {
+                        base.put(month, sourceMonths.getOrDefault(month, 0));
+                    }
                 }
-            } else if ("decrease".equals(act)) {
-                if ("percentage".equals(typ) && value != null) {
-                    base.put(month, (int) Math.round(current * (1 - value / 100.0)));
-                } else if ("absolute".equals(typ) && value != null) {
-                    base.put(month, Math.max(0, (int) Math.round(current - value)));
+                case "increase" -> {
+                    if (isPercentage(step.type()) && value != null) {
+                        base.put(month, (int) Math.round(current * (1 + value / 100.0)));
+                    } else if (isAbsolute(step.type()) && value != null) {
+                        base.put(month, (int) Math.round(current + value));
+                    }
                 }
-            } else if ("set".equals(act)) {
-                if ("absolute".equals(typ) && value != null) {
-                    base.put(month, (int) Math.round(value));
+                case "decrease" -> {
+                    if (isPercentage(step.type()) && value != null) {
+                        base.put(month, (int) Math.round(current * (1 - value / 100.0)));
+                    } else if (isAbsolute(step.type()) && value != null) {
+                        base.put(month, Math.max(0, (int) Math.round(current - value)));
+                    }
                 }
+                case "set" -> {
+                    if (isAbsolute(step.type()) && value != null) {
+                        base.put(month, (int) Math.round(value));
+                    }
+                }
+                default -> { /* unknown action — leave values unchanged */ }
             }
         }
         return base;
@@ -82,7 +93,6 @@ public final class BudgetInstructionApplyService {
         return MONTHS;
     }
 
-    /** Coerce model output to a numeric amount for math (null when not applicable). */
     public static Double toDouble(Object value) {
         if (value == null) {
             return null;
@@ -95,5 +105,13 @@ public final class BudgetInstructionApplyService {
         } catch (NumberFormatException e) {
             return null;
         }
+    }
+
+    private static boolean isPercentage(String type) {
+        return "percentage".equalsIgnoreCase(type);
+    }
+
+    private static boolean isAbsolute(String type) {
+        return "absolute".equalsIgnoreCase(type);
     }
 }

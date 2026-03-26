@@ -12,7 +12,7 @@ public record ParseInstructionRequest(
         @NotBlank String instruction,
         /** Current plan row month totals (Jan–Dec) */
         @NotNull Map<String, Integer> values,
-        /** Plan being edited — used with {@code lineKey} to load prior FY budget for {@code copy}+{@code ly_actual} */
+        /** Plan being edited — used with {@code lineKey} to resolve source data for copy operations */
         @NotNull Long planId,
         /** Stable row id within plan (matches {@link PlanMonthlyDetails#lineKey}) */
         @NotBlank String lineKey) {}

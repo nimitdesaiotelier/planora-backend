@@ -8,22 +8,43 @@ import com.planora.domain.PlanMonthlyDetails;
 import com.planora.web.dto.InstructionStepDto;
 import com.planora.web.dto.ParseInstructionRequest;
 import com.planora.web.dto.ParsedInstructionDto;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import lombok.RequiredArgsConstructor;
+import java.util.Set;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.http.client.ClientHttpRequestFactoryBuilder;
+import org.springframework.boot.http.client.ClientHttpRequestFactorySettings;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
 
+/**
+ * Natural-language budget instruction processor.
+ *
+ * <p>Flow: user text → LLM structured JSON → resolve source data → apply month mutations → preview.
+ *
+ * <p>Supported copy sources (the "type" field in LLM output):
+ * <ul>
+ *   <li>{@code actuals}       – real uploaded actuals from {@code tbl_actuals_details}</li>
+ *   <li>{@code budget}        – plan data from {@code tbl_plan_monthly_details} with {@link com.planora.enums.PlanType#BUDGET}</li>
+ *   <li>{@code forecast}      – plan data with {@link com.planora.enums.PlanType#FORECAST}</li>
+ *   <li>{@code what_if}       – plan data with {@link com.planora.enums.PlanType#WHAT_IF}</li>
+ *   <li>{@code percentage}    – increase/decrease by %</li>
+ *   <li>{@code absolute}      – increase/decrease/set by $ amount</li>
+ * </ul>
+ */
+@Slf4j
 @Service
-@RequiredArgsConstructor
 public class AiParseService {
 
+    // @formatter:off
     private static final String SYSTEM_PROMPT = """
             You are a financial planning assistant.
             Parse the user's natural language into structured JSON only.
@@ -35,32 +56,91 @@ public class AiParseService {
                 {
                   "action": "<increase|decrease|set|copy>",
                   "value": <number or null>,
-                  "type": "<percentage|absolute|ly_actual|plan_copy|null>",
+                  "type": "<percentage|absolute|actuals|budget|forecast|what_if|null>",
+                  "years_ago": <integer or null>,
+                  "property_hint": "<property/country/hotel name or null>",
                   "period": "<Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Q1|Q2|Q3|Q4|full_year|null>",
                   "summary": "<optional per-step note>"
                 }
               ]
             }
 
-            Rules:
-            - If the user gives MULTIPLE independent changes (e.g. "Jan +2000 and Feb +10%"), use MULTIPLE objects in "instructions" — one object per change, each with its own period, type, and value.
-            - Do not merge different periods into one step. Do not pick one quarter for the whole prompt unless the user only mentioned one period.
-            - Single change still uses an array with one element.
-            - action: increase, decrease, set, or copy
-            - type ly_actual means copy prior fiscal year BUDGET for this row (server applies it)
-            - period: one month, Q1–Q4, or full_year
+            RULES:
 
-            Example for "increase Jan by $2000 and Feb by 10%":
-            {"summary":"Raise Jan by $2,000 and Feb by 10%.","instructions":[
-              {"action":"increase","value":2000,"type":"absolute","period":"Jan"},
-              {"action":"increase","value":10,"type":"percentage","period":"Feb"}
+            action:
+            - "increase" for growth/raise/add
+            - "decrease" for reduction/lower/subtract
+            - "set" for absolute assignment (set to X)
+            - "copy" for copying from another data source
+
+            type (for increase/decrease/set):
+            - "percentage" for % changes
+            - "absolute" for $ / fixed-number changes
+
+            type (for copy):
+            - "actuals"  — copy from real actuals data (tbl_actuals_details). Use when user says "actuals", "actual data", "actual numbers", "real numbers".
+            - "budget"   — copy from a BUDGET plan (tbl_plan_monthly_details). Use when user says "budget", "budget data", "budget plan".
+            - "forecast" — copy from a FORECAST plan. Use when user says "forecast", "forecast data".
+            - "what_if"  — copy from a WHAT-IF / scenario plan. Use when user says "what if", "what-if", "scenario".
+
+            years_ago (for copy only):
+            - null or 0 means current fiscal year / this year
+            - 1 means last year / prior year / previous year
+            - 2 means year before last / last to last year / two years ago
+            - N means N fiscal years ago
+            - If user gives an explicit 4-digit year, still convert to years_ago relative to the plan's fiscal year
+
+            property_hint (for copy only):
+            - The property/country/hotel name mentioned by user, or null if same property
+
+            period:
+            - A specific month (Jan–Dec), quarter (Q1–Q4), or "full_year"
+            - If user says multiple months, create separate instructions per period
+            - If no period mentioned, default to "full_year"
+
+            MULTIPLE CHANGES:
+            - If the user gives MULTIPLE independent changes (e.g. "Jan +2000 and Feb +10%"), use MULTIPLE objects in "instructions" — one per change.
+            - Do NOT merge different periods into one step.
+
+            EXAMPLES:
+
+            "Increase by 10% for Q2":
+            {"summary":"Increase Q2 by 10%.","instructions":[
+              {"action":"increase","value":10,"type":"percentage","years_ago":null,"property_hint":null,"period":"Q2"}
             ]}
 
-            Respond with only valid JSON, no markdown.""";
+            "Increase Jan by $2000 and Feb by 10%":
+            {"summary":"Raise Jan by $2,000 and Feb by 10%.","instructions":[
+              {"action":"increase","value":2000,"type":"absolute","years_ago":null,"property_hint":null,"period":"Jan"},
+              {"action":"increase","value":10,"type":"percentage","years_ago":null,"property_hint":null,"period":"Feb"}
+            ]}
+
+            "Set equal to last year actuals":
+            {"summary":"Copy last year actuals.","instructions":[
+              {"action":"copy","value":null,"type":"actuals","years_ago":1,"property_hint":null,"period":"full_year"}
+            ]}
+
+            "Copy last to last year budget data":
+            {"summary":"Copy budget from two fiscal years ago.","instructions":[
+              {"action":"copy","value":null,"type":"budget","years_ago":2,"property_hint":null,"period":"full_year"}
+            ]}
+
+            "Copy Jan data from this year Burlington forecast":
+            {"summary":"Copy Jan from Burlington forecast for this year.","instructions":[
+              {"action":"copy","value":null,"type":"forecast","years_ago":0,"property_hint":"Burlington","period":"Jan"}
+            ]}
+
+            "Copy 3 years ago budget":
+            {"summary":"Copy budget from 3 fiscal years ago.","instructions":[
+              {"action":"copy","value":null,"type":"budget","years_ago":3,"property_hint":null,"period":"full_year"}
+            ]}
+
+            Respond with ONLY valid JSON, no markdown.""";
+    // @formatter:on
 
     private final ObjectMapper objectMapper;
-    private final PriorYearBudgetLineService priorYearBudgetLineService;
-    private final RestClient restClient = RestClient.create();
+    private final SourceDataResolverService sourceDataResolverService;
+    private final RestClient restClient;
 
     @Value("${planora.ai.openai.api-key:}")
     private String openaiApiKey;
@@ -68,33 +148,40 @@ public class AiParseService {
     @Value("${planora.ai.gemini.api-key:}")
     private String geminiApiKey;
 
+    public AiParseService(
+            ObjectMapper objectMapper,
+            SourceDataResolverService sourceDataResolverService) {
+        this.objectMapper = objectMapper;
+        this.sourceDataResolverService = sourceDataResolverService;
+        var settings = new ClientHttpRequestFactorySettings(
+                null,
+                Duration.ofSeconds(10),
+                Duration.ofSeconds(60),
+                null);
+        this.restClient = RestClient.builder()
+                .requestFactory(ClientHttpRequestFactoryBuilder.detect().build(settings))
+                .build();
+    }
+
+    // ─── Public entry point ──────────────────────────────────────────────
+
     public ParsedInstructionDto parse(ParseInstructionRequest req) {
         JsonNode root = fetchParsedJson(req);
         String summary = textOrNull(root, "summary");
         List<InstructionStepDto> steps = parseInstructionsList(root);
 
+        log.debug("AI parsed steps: {}", steps);
+
         if (steps.isEmpty()) {
             throw new IllegalStateException("AI returned no instructions — try rephrasing.");
         }
 
-        boolean needsPriorYear = steps.stream()
-                .anyMatch(s -> "copy".equalsIgnoreCase(s.action()) && "ly_actual".equalsIgnoreCase(s.type()));
-        Map<String, Integer> priorYearBudget =
-                needsPriorYear ? priorYearBudgetLineService.getPriorYearBudgetMonths(req.planId(), req.lineKey()) : Map.of();
-
+        Set<String> warnings = new LinkedHashSet<>();
         Map<String, Integer> working = copyMonths(req.values());
+
         for (InstructionStepDto step : steps) {
-            Map<String, Integer> priorForStep =
-                    ("copy".equalsIgnoreCase(step.action()) && "ly_actual".equalsIgnoreCase(step.type()))
-                            ? priorYearBudget
-                            : Map.of();
-            working = BudgetInstructionApplyService.apply(
-                    working,
-                    priorForStep,
-                    step.action(),
-                    step.type(),
-                    step.period(),
-                    BudgetInstructionApplyService.toDouble(step.value()));
+            Map<String, Integer> sourceMonths = resolveSourceData(req, step, warnings);
+            working = BudgetInstructionApplyService.apply(working, sourceMonths, step);
         }
 
         String mergedSummary = summary;
@@ -106,8 +193,28 @@ public class AiParseService {
                     .orElse("Applied " + steps.size() + " change(s).");
         }
 
-        return new ParsedInstructionDto(mergedSummary, steps, working);
+        List<String> warningList = warnings.isEmpty() ? null : List.copyOf(warnings);
+        return new ParsedInstructionDto(mergedSummary, steps, warningList, working);
     }
+
+    // ─── Source data resolution ──────────────────────────────────────────
+
+    private Map<String, Integer> resolveSourceData(
+            ParseInstructionRequest req, InstructionStepDto step, Set<String> warnings) {
+        if (!"copy".equalsIgnoreCase(step.action())) {
+            return Map.of();
+        }
+        SourceDataResolverService.SourceLookupResult result =
+                sourceDataResolverService.resolve(req.planId(), req.lineKey(), step);
+        if (!result.available()) {
+            if (result.warning() != null && !result.warning().isBlank()) {
+                warnings.add(result.warning());
+            }
+        }
+        return result.months();
+    }
+
+    // ─── Month-map helpers ───────────────────────────────────────────────
 
     private static Map<String, Integer> copyMonths(Map<String, Integer> values) {
         Map<String, Integer> m = new LinkedHashMap<>();
@@ -117,10 +224,8 @@ public class AiParseService {
         return m;
     }
 
-    /**
-     * Accepts: (1) object with "instructions" array, (2) legacy single-step object with "action",
-     * (3) root JSON array of step objects (normalized).
-     */
+    // ─── LLM JSON parsing ───────────────────────────────────────────────
+
     private List<InstructionStepDto> parseInstructionsList(JsonNode root) {
         if (root == null || root.isNull()) {
             return List.of();
@@ -159,24 +264,32 @@ public class AiParseService {
                 val = n.get("value").asText();
             }
         }
+        Integer yearsAgo = null;
+        if (n.has("years_ago") && !n.get("years_ago").isNull()) {
+            yearsAgo = n.get("years_ago").asInt(0);
+        }
         return new InstructionStepDto(
                 textOrNull(n, "action"),
                 val,
                 textOrNull(n, "type"),
+                yearsAgo,
+                textOrNull(n, "property_hint"),
                 textOrNull(n, "period"),
                 textOrNull(n, "summary"));
     }
 
+    // ─── LLM provider calls ─────────────────────────────────────────────
+
     private JsonNode fetchParsedJson(ParseInstructionRequest req) {
         String p = req.provider().toLowerCase(Locale.ROOT).trim();
         return switch (p) {
-            case "openai" -> parseOpenAiToJson(req);
-            case "gemini" -> parseGeminiToJson(req);
+            case "openai" -> callOpenAi(req);
+            case "gemini" -> callGemini(req);
             default -> throw new IllegalArgumentException("provider must be 'openai' or 'gemini'");
         };
     }
 
-    private JsonNode parseOpenAiToJson(ParseInstructionRequest req) {
+    private JsonNode callOpenAi(ParseInstructionRequest req) {
         if (openaiApiKey == null || openaiApiKey.isBlank()) {
             throw new IllegalStateException("OPENAI_API_KEY / planora.ai.openai.api-key is not configured");
         }
@@ -186,12 +299,8 @@ public class AiParseService {
         ObjectNode body = objectMapper.createObjectNode();
         body.put("model", "gpt-4o-mini");
         ArrayNode messages = body.putArray("messages");
-        ObjectNode systemMsg = messages.addObject();
-        systemMsg.put("role", "system");
-        systemMsg.put("content", SYSTEM_PROMPT);
-        ObjectNode userMsg = messages.addObject();
-        userMsg.put("role", "user");
-        userMsg.put("content", userContent);
+        messages.addObject().put("role", "system").put("content", SYSTEM_PROMPT);
+        messages.addObject().put("role", "user").put("content", userContent);
         body.putObject("response_format").put("type", "json_object");
         body.put("temperature", 0);
 
@@ -217,7 +326,7 @@ public class AiParseService {
         }
     }
 
-    private JsonNode parseGeminiToJson(ParseInstructionRequest req) {
+    private JsonNode callGemini(ParseInstructionRequest req) {
         if (geminiApiKey == null || geminiApiKey.isBlank()) {
             throw new IllegalStateException("GEMINI_API_KEY / planora.ai.gemini.api-key is not configured");
         }
@@ -231,13 +340,10 @@ public class AiParseService {
                 .put("responseMimeType", "application/json")
                 .put("temperature", 0);
 
-        String url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key="
-                + geminiApiKey;
-
         String raw;
         try {
             raw = restClient.post()
-                    .uri(url)
+                    .uri("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}", geminiApiKey)
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(objectMapper.writeValueAsString(body))
                     .retrieve()
@@ -255,7 +361,6 @@ public class AiParseService {
         }
     }
 
-    /** If the model returns a raw array of steps, wrap as { "instructions": [...] }. */
     private JsonNode normalizeRoot(JsonNode node) {
         if (node != null && node.isArray()) {
             ObjectNode wrap = objectMapper.createObjectNode();
