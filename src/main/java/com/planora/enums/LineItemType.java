@@ -1,4 +1,4 @@
-package com.planora.domain;
+package com.planora.enums;
 
 /**
  * Line-item classification: only Revenue, Expense, and Statistics are allowed.

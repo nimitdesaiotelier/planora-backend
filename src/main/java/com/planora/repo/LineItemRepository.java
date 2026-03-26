@@ -1,15 +1,15 @@
 package com.planora.repo;
 
-import com.planora.domain.LineItem;
+import com.planora.domain.PlanMonthlyDetails;
 import java.util.List;
 import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;
 
-public interface LineItemRepository extends JpaRepository<LineItem, Long> {
+public interface LineItemRepository extends JpaRepository<PlanMonthlyDetails, Long> {
 
-    List<LineItem> findByPlan_Id(Long planId);
+    List<PlanMonthlyDetails> findByPlan_Id(Long planId);
 
-    Optional<LineItem> findByIdAndPlan_Id(Long id, Long planId);
+    Optional<PlanMonthlyDetails> findByIdAndPlan_Id(Long id, Long planId);
 
-    Optional<LineItem> findByPlan_IdAndLineKey(Long planId, String lineKey);
+    Optional<PlanMonthlyDetails> findByPlan_IdAndLineKey(Long planId, String lineKey);
 }

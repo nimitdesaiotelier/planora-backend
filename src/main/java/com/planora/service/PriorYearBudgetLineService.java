@@ -1,8 +1,8 @@
 package com.planora.service;
 
-import com.planora.domain.LineItem;
+import com.planora.domain.PlanMonthlyDetails;
 import com.planora.domain.Plan;
-import com.planora.domain.PlanType;
+import com.planora.enums.PlanType;
 import com.planora.repo.LineItemRepository;
 import com.planora.repo.PlanRepository;
 import java.util.LinkedHashMap;
@@ -41,13 +41,13 @@ public class PriorYearBudgetLineService {
         }
         return lineItemRepository
                 .findByPlan_IdAndLineKey(priorBudget.get().getId(), lineKey)
-                .map(LineItem::toValuesMap)
+                .map(PlanMonthlyDetails::toValuesMap)
                 .orElseGet(PriorYearBudgetLineService::zeroMonths);
     }
 
     private static Map<String, Integer> zeroMonths() {
         Map<String, Integer> m = new LinkedHashMap<>();
-        for (String month : LineItem.MONTH_KEYS) {
+        for (String month : PlanMonthlyDetails.MONTH_KEYS) {
             m.put(month, 0);
         }
         return m;

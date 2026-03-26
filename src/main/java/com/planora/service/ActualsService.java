@@ -1,6 +1,6 @@
 package com.planora.service;
 
-import com.planora.domain.ActualsDetail;
+import com.planora.domain.ActualsDetails;
 import com.planora.domain.Property;
 import com.planora.repo.ActualsDetailRepository;
 import com.planora.repo.PropertyRepository;
@@ -38,10 +38,10 @@ public class ActualsService {
         List<ParsedActualsRow> rows = actualsExcelParser.parse(file.getInputStream());
         int count = 0;
         for (ParsedActualsRow r : rows) {
-            ActualsDetail e = actualsDetailRepository
+            ActualsDetails e = actualsDetailRepository
                     .findByCoaCodeAndYearAndProperty_IdAndOrganizationId(
                             r.coaCode(), year, propertyId, organizationId)
-                    .orElseGet(ActualsDetail::new);
+                    .orElseGet(ActualsDetails::new);
             e.setCoaCode(r.coaCode());
             e.setYear(year);
             e.setProperty(property);
@@ -66,7 +66,7 @@ public class ActualsService {
         return count;
     }
 
-    private ActualsDetailDto toDto(ActualsDetail e) {
+    private ActualsDetailDto toDto(ActualsDetails e) {
         return new ActualsDetailDto(
                 e.getId(),
                 e.getCoaCode(),

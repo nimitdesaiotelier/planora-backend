@@ -1,4 +1,4 @@
-package com.planora.domain;
+package com.planora.enums;
 
 public enum PlanType {
     BUDGET,

@@ -1,6 +1,6 @@
 package com.planora.web.dto;
 
-import com.planora.domain.PlanType;
+import com.planora.enums.PlanType;
 
 public record PlanSummaryDto(
         Long id,

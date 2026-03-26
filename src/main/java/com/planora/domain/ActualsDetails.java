@@ -33,7 +33,7 @@ import org.hibernate.type.SqlTypes;
 @Getter
 @Setter
 @NoArgsConstructor
-public class ActualsDetail {
+public class ActualsDetails {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)

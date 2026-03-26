@@ -1,5 +1,6 @@
 package com.planora.web.dto;
 
+import com.planora.domain.PlanMonthlyDetails;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import java.util.Map;
@@ -13,5 +14,5 @@ public record ParseInstructionRequest(
         @NotNull Map<String, Integer> values,
         /** Plan being edited — used with {@code lineKey} to load prior FY budget for {@code copy}+{@code ly_actual} */
         @NotNull Long planId,
-        /** Stable row id within plan (matches {@link com.planora.domain.LineItem#lineKey}) */
+        /** Stable row id within plan (matches {@link PlanMonthlyDetails#lineKey}) */
         @NotBlank String lineKey) {}

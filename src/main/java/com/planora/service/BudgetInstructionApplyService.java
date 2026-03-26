@@ -1,6 +1,7 @@
 package com.planora.service;
 
-import java.util.ArrayList;
+import com.planora.enums.PlanType;
+
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -22,7 +23,7 @@ public final class BudgetInstructionApplyService {
     private BudgetInstructionApplyService() {}
 
     /**
-     * @param priorYearBudgetMonths monthly values from prior FY {@link com.planora.domain.PlanType#BUDGET} (same property,
+     * @param priorYearBudgetMonths monthly values from prior FY {@link PlanType#BUDGET} (same property,
      *                              same line); used only for {@code copy}+{@code ly_actual}
      */
     public static Map<String, Integer> apply(

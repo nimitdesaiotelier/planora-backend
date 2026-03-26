@@ -1,9 +1,9 @@
 package com.planora.bootstrap;
 
-import com.planora.domain.LineItem;
-import com.planora.domain.LineItemType;
+import com.planora.domain.PlanMonthlyDetails;
+import com.planora.enums.LineItemType;
 import com.planora.domain.Plan;
-import com.planora.domain.PlanType;
+import com.planora.enums.PlanType;
 import com.planora.domain.Property;
 import com.planora.repo.PlanRepository;
 import com.planora.repo.PropertyRepository;
@@ -69,7 +69,7 @@ public class PlanSampleDataLoader implements ApplicationRunner {
     private void addLines(Plan plan, List<LineTemplate> templates, double scale) {
         int year = plan.getFiscalYear();
         for (LineTemplate t : templates) {
-            LineItem item = new LineItem();
+            PlanMonthlyDetails item = new PlanMonthlyDetails();
             item.setPlan(plan);
             item.setLineKey(t.lineKey());
             item.setDepartment(t.department());
@@ -91,7 +91,7 @@ public class PlanSampleDataLoader implements ApplicationRunner {
 
     private static Map<String, List<Integer>> buildDailyFromMonthly(Map<String, Integer> monthTotals, int year) {
         Map<String, List<Integer>> out = new LinkedHashMap<>();
-        for (String month : LineItem.MONTH_KEYS) {
+        for (String month : PlanMonthlyDetails.MONTH_KEYS) {
             int total = monthTotals.getOrDefault(month, 0);
             int days = daysInMonth(month, year);
             out.put(month, splitEvenAcrossDays(total, days));

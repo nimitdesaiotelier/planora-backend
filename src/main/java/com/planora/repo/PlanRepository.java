@@ -1,7 +1,7 @@
 package com.planora.repo;
 
 import com.planora.domain.Plan;
-import com.planora.domain.PlanType;
+import com.planora.enums.PlanType;
 import java.util.List;
 import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;

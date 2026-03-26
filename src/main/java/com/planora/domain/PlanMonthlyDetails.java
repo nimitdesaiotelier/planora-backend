@@ -1,5 +1,6 @@
 package com.planora.domain;
 
+import com.planora.enums.LineItemType;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EnumType;
@@ -30,7 +31,7 @@ import org.hibernate.type.SqlTypes;
 @Getter
 @Setter
 @NoArgsConstructor
-public class LineItem {
+public class PlanMonthlyDetails {
 
     public static final List<String> MONTH_KEYS = List.of(
             "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec");

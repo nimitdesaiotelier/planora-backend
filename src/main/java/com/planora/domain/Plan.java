@@ -1,5 +1,6 @@
 package com.planora.domain;
 
+import com.planora.enums.PlanType;
 import jakarta.persistence.CascadeType;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -49,5 +50,5 @@ public class Plan {
     private Instant createdAt = Instant.now();
 
     @OneToMany(mappedBy = "plan", cascade = CascadeType.ALL, orphanRemoval = true)
-    private List<LineItem> lineItems = new ArrayList<>();
+    private List<PlanMonthlyDetails> lineItems = new ArrayList<>();
 }

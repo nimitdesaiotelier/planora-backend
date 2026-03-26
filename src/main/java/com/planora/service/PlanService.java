@@ -1,8 +1,8 @@
 package com.planora.service;
 
-import com.planora.domain.ActualsDetail;
-import com.planora.domain.LineItem;
-import com.planora.domain.LineItemType;
+import com.planora.domain.ActualsDetails;
+import com.planora.domain.PlanMonthlyDetails;
+import com.planora.enums.LineItemType;
 import com.planora.domain.Plan;
 import com.planora.repo.ActualsDetailRepository;
 import com.planora.repo.LineItemRepository;
@@ -46,16 +46,16 @@ public class PlanService {
     public List<LineItemDto> listLineItems(Long planId) {
         Plan plan = planRepository.findById(planId).orElseThrow(() -> new EntityNotFoundException("Plan not found: " + planId));
 
-        Map<String, ActualsDetail> actualsByCoa = actualsDetailRepository
+        Map<String, ActualsDetails> actualsByCoa = actualsDetailRepository
                 .findByYearAndProperty_IdAndOrganizationIdOrderByCoaCodeAsc(
                         plan.getFiscalYear(), plan.getProperty().getId(), DEFAULT_ORG_ID)
                 .stream()
-                .collect(Collectors.toMap(ActualsDetail::getCoaCode, a -> a, (a, b) -> a));
+                .collect(Collectors.toMap(ActualsDetails::getCoaCode, a -> a, (a, b) -> a));
 
         return lineItemRepository.findByPlan_Id(planId).stream()
                 .sorted(Comparator
-                        .comparing((LineItem li) -> lineTypeOrder(li.getType()))
-                        .thenComparing(LineItem::getLabel, String.CASE_INSENSITIVE_ORDER))
+                        .comparing((PlanMonthlyDetails li) -> lineTypeOrder(li.getType()))
+                        .thenComparing(PlanMonthlyDetails::getLabel, String.CASE_INSENSITIVE_ORDER))
                 .map(li -> toLineItemDto(li, actualsByCoa.get(li.getLineKey())))
                 .toList();
     }
@@ -63,7 +63,7 @@ public class PlanService {
     @Transactional
     public LineItemDto updateLineItemValues(Long planId, Long lineItemId, UpdateLineItemValuesRequest body) {
         Plan plan = planRepository.findById(planId).orElseThrow(() -> new EntityNotFoundException("Plan not found: " + planId));
-        LineItem item = lineItemRepository
+        PlanMonthlyDetails item = lineItemRepository
                 .findByIdAndPlan_Id(lineItemId, planId)
                 .orElseThrow(() -> new EntityNotFoundException(
                         "Line item %d not found for plan %d".formatted(lineItemId, planId)));
@@ -71,8 +71,8 @@ public class PlanService {
         if (body.dailyDetails() != null) {
             item.applyDailyDetailsMap(body.dailyDetails());
         }
-        LineItem saved = lineItemRepository.save(item);
-        ActualsDetail ad = actualsDetailRepository
+        PlanMonthlyDetails saved = lineItemRepository.save(item);
+        ActualsDetails ad = actualsDetailRepository
                 .findByCoaCodeAndYearAndProperty_IdAndOrganizationId(
                         saved.getLineKey(), plan.getFiscalYear(), plan.getProperty().getId(), DEFAULT_ORG_ID)
                 .orElse(null);
@@ -97,7 +97,7 @@ public class PlanService {
         };
     }
 
-    private LineItemDto toLineItemDto(LineItem li, ActualsDetail actuals) {
+    private LineItemDto toLineItemDto(PlanMonthlyDetails li, ActualsDetails actuals) {
         Map<String, List<Integer>> daily = li.getDailyDetails() == null
                 ? new LinkedHashMap<>()
                 : new LinkedHashMap<>(li.getDailyDetails());
@@ -113,7 +113,7 @@ public class PlanService {
                 actuals == null ? Map.of() : actualsToMonthMap(actuals));
     }
 
-    private static Map<String, Integer> actualsToMonthMap(ActualsDetail a) {
+    private static Map<String, Integer> actualsToMonthMap(ActualsDetails a) {
         Map<String, Integer> m = new LinkedHashMap<>();
         m.put("Jan", bdToInt(a.getJanValue()));
         m.put("Feb", bdToInt(a.getFebValue()));

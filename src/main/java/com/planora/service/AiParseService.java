@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.planora.domain.PlanMonthlyDetails;
 import com.planora.web.dto.InstructionStepDto;
 import com.planora.web.dto.ParseInstructionRequest;
 import com.planora.web.dto.ParsedInstructionDto;
@@ -110,7 +111,7 @@ public class AiParseService {
 
     private static Map<String, Integer> copyMonths(Map<String, Integer> values) {
         Map<String, Integer> m = new LinkedHashMap<>();
-        for (String month : com.planora.domain.LineItem.MONTH_KEYS) {
+        for (String month : PlanMonthlyDetails.MONTH_KEYS) {
             m.put(month, values != null ? values.getOrDefault(month, 0) : 0);
         }
         return m;
