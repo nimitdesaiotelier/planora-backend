@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.planora.domain.PlanMonthlyDetails;
+import com.planora.enums.LineItemType;
 import com.planora.web.dto.InstructionStepDto;
 import com.planora.web.dto.ParseInstructionRequest;
 import com.planora.web.dto.ParsedInstructionDto;
@@ -28,7 +29,8 @@ import org.springframework.web.client.RestClient;
 /**
  * Natural-language budget instruction processor.
  *
- * <p>Flow: user text → LLM structured JSON → resolve source data → apply month mutations → preview.
+ * <p>Flow: user text → LLM structured JSON → resolve source data → apply month mutations → optional
+ * daily split from new month totals → preview ({@code newValues}, {@code newDailyDetails}).
  *
  * <p>Supported copy sources (the "type" field in LLM output):
  * <ul>
@@ -60,6 +62,8 @@ public class AiParseService {
                   "years_ago": <integer or null>,
                   "property_hint": "<property/country/hotel name or null>",
                   "period": "<Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Q1|Q2|Q3|Q4|full_year|null>",
+                  "day_from": <1-31 or null>,
+                  "day_to": <1-31 or null>,
                   "summary": "<optional per-step note>"
                 }
               ]
@@ -98,6 +102,14 @@ public class AiParseService {
             - If user says multiple months, create separate instructions per period
             - If no period mentioned, default to "full_year"
 
+            day_from / day_to (optional, calendar days 1–31 inclusive within each affected month):
+            - Omit BOTH when the change applies to the whole month (or whole quarter/year via period).
+            - When the user names specific day(s) in a month, set them for that month’s period.
+            - "April 1 only", "first day of April", "Apr 1st" → period "Apr", day_from 1, day_to 1
+            - "April 1 through 10" → period "Apr", day_from 1, day_to 10
+            - For a single day you may set only day_from; day_to defaults to the same day.
+            - "copy" steps: omit day_from/day_to (whole months are copied); the engine replaces all days in affected months.
+
             MULTIPLE CHANGES:
             - If the user gives MULTIPLE independent changes (e.g. "Jan +2000 and Feb +10%"), use MULTIPLE objects in "instructions" — one per change.
             - Do NOT merge different periods into one step.
@@ -106,7 +118,12 @@ public class AiParseService {
 
             "Increase by 10% for Q2":
             {"summary":"Increase Q2 by 10%.","instructions":[
-              {"action":"increase","value":10,"type":"percentage","years_ago":null,"property_hint":null,"period":"Q2"}
+              {"action":"increase","value":10,"type":"percentage","years_ago":null,"property_hint":null,"period":"Q2","day_from":null,"day_to":null}
+            ]}
+
+            "Increase 10% for April on the 1st only":
+            {"summary":"Increase April 1 by 10%.","instructions":[
+              {"action":"increase","value":10,"type":"percentage","years_ago":null,"property_hint":null,"period":"Apr","day_from":1,"day_to":1}
             ]}
 
             "Increase Jan by $2000 and Feb by 10%":
@@ -140,6 +157,7 @@ public class AiParseService {
 
     private final ObjectMapper objectMapper;
     private final SourceDataResolverService sourceDataResolverService;
+    private final DailyDetailsSplitService dailyDetailsSplitService;
     private final RestClient restClient;
 
     @Value("${planora.ai.openai.api-key:}")
@@ -150,9 +168,11 @@ public class AiParseService {
 
     public AiParseService(
             ObjectMapper objectMapper,
-            SourceDataResolverService sourceDataResolverService) {
+            SourceDataResolverService sourceDataResolverService,
+            DailyDetailsSplitService dailyDetailsSplitService) {
         this.objectMapper = objectMapper;
         this.sourceDataResolverService = sourceDataResolverService;
+        this.dailyDetailsSplitService = dailyDetailsSplitService;
         var settings = new ClientHttpRequestFactorySettings(
                 null,
                 Duration.ofSeconds(10),
@@ -177,11 +197,51 @@ public class AiParseService {
         }
 
         Set<String> warnings = new LinkedHashSet<>();
-        Map<String, Integer> working = copyMonths(req.values());
+        Integer fy = req.fiscalYear();
+        String typeStr = req.lineItemType();
 
-        for (InstructionStepDto step : steps) {
-            Map<String, Integer> sourceMonths = resolveSourceData(req, step, warnings);
-            working = BudgetInstructionApplyService.apply(working, sourceMonths, step);
+        Map<String, Integer> working;
+        Map<String, List<Integer>> newDailyDetails = null;
+
+        if (DailyBudgetInstructionApplyService.anyStepTargetsSpecificDays(steps)) {
+            if (fy == null || typeStr == null || typeStr.isBlank()) {
+                throw new IllegalStateException(
+                        "Day-specific changes require fiscalYear and lineItemType on the request.");
+            }
+            LineItemType lineType;
+            try {
+                lineType = LineItemType.valueOf(typeStr.trim());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalStateException("Invalid lineItemType: " + typeStr);
+            }
+            Map<String, List<Integer>> daily =
+                    DailyBudgetInstructionApplyService.baseline(
+                            req.values(),
+                            req.dailyDetails(),
+                            fy,
+                            lineType,
+                            dailyDetailsSplitService);
+            for (InstructionStepDto step : steps) {
+                Map<String, Integer> sourceMonths = resolveSourceData(req, step, warnings);
+                DailyBudgetInstructionApplyService.applyStep(
+                        daily, step, sourceMonths, fy, lineType, dailyDetailsSplitService);
+            }
+            working = DailyBudgetInstructionApplyService.aggregateMonthsFromDaily(daily);
+            newDailyDetails = deepCopyDaily(daily);
+        } else {
+            working = copyMonths(req.values());
+            for (InstructionStepDto step : steps) {
+                Map<String, Integer> sourceMonths = resolveSourceData(req, step, warnings);
+                working = BudgetInstructionApplyService.apply(working, sourceMonths, step);
+            }
+            if (fy != null && typeStr != null && !typeStr.isBlank()) {
+                try {
+                    LineItemType lineType = LineItemType.valueOf(typeStr.trim());
+                    newDailyDetails = dailyDetailsSplitService.buildDailyFromMonthly(working, fy, lineType);
+                } catch (IllegalArgumentException e) {
+                    log.warn("Skipping newDailyDetails: bad lineItemType \"{}\"", typeStr);
+                }
+            }
         }
 
         String mergedSummary = summary;
@@ -194,7 +254,8 @@ public class AiParseService {
         }
 
         List<String> warningList = warnings.isEmpty() ? null : List.copyOf(warnings);
-        return new ParsedInstructionDto(mergedSummary, steps, warningList, working);
+
+        return new ParsedInstructionDto(mergedSummary, steps, warningList, working, newDailyDetails);
     }
 
     // ─── Source data resolution ──────────────────────────────────────────
@@ -222,6 +283,15 @@ public class AiParseService {
             m.put(month, values != null ? values.getOrDefault(month, 0) : 0);
         }
         return m;
+    }
+
+    private static Map<String, List<Integer>> deepCopyDaily(Map<String, List<Integer>> daily) {
+        Map<String, List<Integer>> out = new LinkedHashMap<>();
+        for (Map.Entry<String, List<Integer>> e : daily.entrySet()) {
+            List<Integer> list = e.getValue();
+            out.put(e.getKey(), list == null ? new ArrayList<>() : new ArrayList<>(list));
+        }
+        return out;
     }
 
     // ─── LLM JSON parsing ───────────────────────────────────────────────
@@ -275,7 +345,16 @@ public class AiParseService {
                 yearsAgo,
                 textOrNull(n, "property_hint"),
                 textOrNull(n, "period"),
-                textOrNull(n, "summary"));
+                textOrNull(n, "summary"),
+                optionalInt(n, "day_from"),
+                optionalInt(n, "day_to"));
+    }
+
+    private static Integer optionalInt(JsonNode n, String field) {
+        if (n == null || !n.isObject() || !n.has(field) || n.get(field).isNull()) {
+            return null;
+        }
+        return n.get(field).asInt();
     }
 
     // ─── LLM provider calls ─────────────────────────────────────────────

@@ -10,4 +10,8 @@ public record InstructionStepDto(
         Integer yearsAgo,
         String propertyHint,
         String period,
-        String summary) {}
+        String summary,
+        /** 1-based calendar day within month; when set with {@link #dayTo}, only those days are changed. */
+        Integer dayFrom,
+        /** 1-based inclusive end day; defaults to {@link #dayFrom} when only one day. */
+        Integer dayTo) {}
