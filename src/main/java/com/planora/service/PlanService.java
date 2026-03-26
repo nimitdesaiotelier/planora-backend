@@ -1,14 +1,15 @@
 package com.planora.service;
 
 import com.planora.domain.ActualsDetails;
+import com.planora.domain.Plan;
 import com.planora.domain.PlanMonthlyDetails;
 import com.planora.enums.LineItemType;
-import com.planora.domain.Plan;
 import com.planora.repo.ActualsDetailRepository;
 import com.planora.repo.LineItemRepository;
 import com.planora.repo.PlanRepository;
 import com.planora.web.dto.LineItemDto;
 import com.planora.web.dto.PlanSummaryDto;
+import com.planora.web.dto.RegenerateDailyDetailsResponse;
 import com.planora.web.dto.UpdateLineItemValuesRequest;
 import jakarta.persistence.EntityNotFoundException;
 import java.math.BigDecimal;
@@ -30,6 +31,7 @@ public class PlanService {
     private final PlanRepository planRepository;
     private final LineItemRepository lineItemRepository;
     private final ActualsDetailRepository actualsDetailRepository;
+    private final DailyDetailsSplitService dailyDetailsSplitService;
 
     @Transactional(readOnly = true)
     public List<PlanSummaryDto> listPlans(Long propertyId) {
@@ -67,9 +69,14 @@ public class PlanService {
                 .findByIdAndPlan_Id(lineItemId, planId)
                 .orElseThrow(() -> new EntityNotFoundException(
                         "Line item %d not found for plan %d".formatted(lineItemId, planId)));
-        item.applyValuesMap(body.values());
         if (body.dailyDetails() != null) {
             item.applyDailyDetailsMap(body.dailyDetails());
+            applyMonthTotalsFromDailySums(item);
+        } else {
+            if (body.values() == null) {
+                throw new IllegalArgumentException("values are required when dailyDetails is omitted");
+            }
+            item.applyValuesMap(body.values());
         }
         PlanMonthlyDetails saved = lineItemRepository.save(item);
         ActualsDetails ad = actualsDetailRepository
@@ -77,6 +84,37 @@ public class PlanService {
                         saved.getLineKey(), plan.getFiscalYear(), plan.getProperty().getId(), DEFAULT_ORG_ID)
                 .orElse(null);
         return toLineItemDto(saved, ad);
+    }
+
+    @Transactional
+    public RegenerateDailyDetailsResponse regenerateDailyDetails(Long planId, Long lineItemId) {
+        Plan plan = planRepository.findById(planId)
+                .orElseThrow(() -> new EntityNotFoundException("Plan not found: " + planId));
+
+        List<PlanMonthlyDetails> items;
+        if (lineItemId != null) {
+            PlanMonthlyDetails one = lineItemRepository.findByIdAndPlan_Id(lineItemId, planId)
+                    .orElseThrow(() -> new EntityNotFoundException(
+                            "Line item %d not found for plan %d".formatted(lineItemId, planId)));
+            items = List.of(one);
+        } else {
+            items = lineItemRepository.findByPlan_Id(planId);
+        }
+
+        for (PlanMonthlyDetails item : items) {
+            Map<String, List<Integer>> daily = dailyDetailsSplitService.buildDailyFromMonthly(
+                    item.toValuesMap(),
+                    plan.getFiscalYear(),
+                    item.getType());
+            item.applyDailyDetailsMap(daily);
+        }
+        lineItemRepository.saveAll(items);
+
+        List<Long> updatedIds = items.stream().map(PlanMonthlyDetails::getId).toList();
+        String message = lineItemId == null
+                ? "Regenerated daily details for " + items.size() + " line item(s)."
+                : "Regenerated daily details for line item " + lineItemId + ".";
+        return new RegenerateDailyDetailsResponse(planId, items.size(), updatedIds, message);
     }
 
     private PlanSummaryDto toSummary(Plan p) {
@@ -87,6 +125,26 @@ public class PlanService {
                 p.getFiscalYear(),
                 p.getProperty().getId(),
                 p.getProperty().getName());
+    }
+
+    /** Sets jan–dec columns from the sum of each month’s daily list. */
+    private static void applyMonthTotalsFromDailySums(PlanMonthlyDetails item) {
+        Map<String, List<Integer>> d = item.getDailyDetails();
+        if (d == null) {
+            return;
+        }
+        Map<String, Integer> totals = new LinkedHashMap<>();
+        for (String month : PlanMonthlyDetails.MONTH_KEYS) {
+            List<Integer> list = d.get(month);
+            int sum = 0;
+            if (list != null) {
+                for (Integer v : list) {
+                    sum += v != null ? v : 0;
+                }
+            }
+            totals.put(month, sum);
+        }
+        item.applyValuesMap(totals);
     }
 
     private static int lineTypeOrder(LineItemType t) {
