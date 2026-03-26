@@ -6,6 +6,7 @@ import java.util.List;
 public record ActualsDetailDto(
         Long id,
         String coaCode,
+        String coaName,
         BigDecimal janValue,
         BigDecimal febValue,
         BigDecimal marValue,
