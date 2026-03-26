@@ -42,6 +42,9 @@ public class ActualsDetails {
     @Column(name = "coa_code", nullable = false, length = 255)
     private String coaCode;
 
+    @Column(name = "coa_name", length = 255)
+    private String coaName;
+
     @Column(precision = 19, scale = 4)
     private BigDecimal janValue;
 

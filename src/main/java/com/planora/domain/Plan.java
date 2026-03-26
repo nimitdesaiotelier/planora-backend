@@ -1,6 +1,7 @@
 package com.planora.domain;
 
 import com.planora.enums.PlanType;
+import com.planora.enums.PlanStatus;
 import jakarta.persistence.CascadeType;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
@@ -38,6 +39,10 @@ public class Plan {
     @Enumerated(EnumType.STRING)
     @Column(name = "plan_type", nullable = false, length = 32)
     private PlanType planType;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 32)
+    private PlanStatus status = PlanStatus.ACTIVE;
 
     @Column(name = "fiscal_year", nullable = false)
     private Integer fiscalYear;
