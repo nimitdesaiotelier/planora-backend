@@ -3,6 +3,8 @@ package com.planora.service;
 import com.planora.domain.PlanMonthlyDetails;
 import com.planora.enums.LineItemType;
 import com.planora.web.dto.InstructionStepDto;
+import java.time.DayOfWeek;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -76,11 +78,20 @@ public final class DailyBudgetInstructionApplyService {
             return;
         }
 
-        applyNumericToDaily(daily, step, lineItemType);
+        applyNumericToDaily(daily, step, lineItemType, fiscalYear);
     }
 
+    private static final Map<String, Integer> MONTH_NUMBER = Map.ofEntries(
+            Map.entry("Jan", 1), Map.entry("Feb", 2), Map.entry("Mar", 3),
+            Map.entry("Apr", 4), Map.entry("May", 5), Map.entry("Jun", 6),
+            Map.entry("Jul", 7), Map.entry("Aug", 8), Map.entry("Sep", 9),
+            Map.entry("Oct", 10), Map.entry("Nov", 11), Map.entry("Dec", 12));
+
     private static void applyNumericToDaily(
-            Map<String, List<Integer>> daily, InstructionStepDto step, LineItemType lineItemType) {
+            Map<String, List<Integer>> daily,
+            InstructionStepDto step,
+            LineItemType lineItemType,
+            int fiscalYear) {
 
         String action = step.action() == null ? "" : step.action().toLowerCase();
         Double value = BudgetInstructionApplyService.toDouble(step.value());
@@ -88,6 +99,8 @@ public final class DailyBudgetInstructionApplyService {
 
         Integer df = step.dayFrom();
         Integer dt = step.dayTo();
+        String dayFilter = step.dayFilter();
+        boolean hasDayFilter = dayFilter != null && !dayFilter.isBlank();
         boolean wholeMonth = df == null && dt == null;
 
         boolean pct = "percentage".equalsIgnoreCase(step.type());
@@ -109,7 +122,20 @@ public final class DailyBudgetInstructionApplyService {
                 toDay = tmp;
             }
 
+            int monthNum = MONTH_NUMBER.getOrDefault(month, 1);
+
             for (int day = fromDay; day <= toDay; day++) {
+                if (hasDayFilter) {
+                    DayOfWeek dow = LocalDate.of(fiscalYear, monthNum, day).getDayOfWeek();
+                    boolean isWeekend = dow == DayOfWeek.SATURDAY || dow == DayOfWeek.SUNDAY;
+                    if ("weekends".equalsIgnoreCase(dayFilter) && !isWeekend) {
+                        continue;
+                    }
+                    if ("weekdays".equalsIgnoreCase(dayFilter) && isWeekend) {
+                        continue;
+                    }
+                }
+
                 int idx = day - 1;
                 int current = list.get(idx);
                 int next = switch (action) {
@@ -124,17 +150,16 @@ public final class DailyBudgetInstructionApplyService {
                     }
                     case "decrease" -> {
                         if (pct && value != null) {
-                            yield Math.max(
-                                    0, roundForLineType(current * (1 - value / 100.0), lineItemType));
+                            yield roundForLineType(current * (1 - value / 100.0), lineItemType);
                         }
                         if (abs && value != null) {
-                            yield Math.max(0, roundForLineType(current - value, lineItemType));
+                            yield roundForLineType(current - value, lineItemType);
                         }
                         yield current;
                     }
                     case "set" -> {
                         if (abs && value != null) {
-                            yield Math.max(0, roundForLineType(value, lineItemType));
+                            yield roundForLineType(value, lineItemType);
                         }
                         yield current;
                     }
@@ -155,6 +180,9 @@ public final class DailyBudgetInstructionApplyService {
     public static boolean anyStepTargetsSpecificDays(List<InstructionStepDto> steps) {
         for (InstructionStepDto s : steps) {
             if (s.dayFrom() != null || s.dayTo() != null) {
+                return true;
+            }
+            if (s.dayFilter() != null && !s.dayFilter().isBlank()) {
                 return true;
             }
         }

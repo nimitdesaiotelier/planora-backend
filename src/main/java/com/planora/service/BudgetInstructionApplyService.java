@@ -64,7 +64,7 @@ public final class BudgetInstructionApplyService {
                     if (isPercentage(step.type()) && value != null) {
                         base.put(month, (int) Math.round(current * (1 - value / 100.0)));
                     } else if (isAbsolute(step.type()) && value != null) {
-                        base.put(month, Math.max(0, (int) Math.round(current - value)));
+                        base.put(month, (int) Math.round(current - value));
                     }
                 }
                 case "set" -> {
