@@ -13,4 +13,9 @@ public record ParsedInstructionDto(
         /** Non-fatal issues while applying instruction (e.g. missing source-year actuals) */
         List<String> warnings,
         /** Month totals after applying every step in order */
-        Map<String, Integer> newValues) {}
+        Map<String, Integer> newValues,
+        /**
+         * Daily breakdown matching {@code newValues} when fiscal year and line item type were sent on the request;
+         * use with PATCH {@code dailyDetails} so the server can persist dailies and aggregate month totals.
+         */
+        Map<String, List<Integer>> newDailyDetails) {}
