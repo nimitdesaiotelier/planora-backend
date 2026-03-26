@@ -1,0 +1,8 @@
+# Option A — next to pom.xml (only works if Run "Working directory" is planora-backend):
+#   Copy this file to application-local.properties
+#
+# Option B — preferred for IntelliJ: use src/main/resources/application-local.properties.example there instead.
+
+spring.datasource.url=jdbc:postgresql://ep-winter-resonance-a1d8inid-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+spring.datasource.username=neondb_owner
+spring.datasource.password=npg_2qaopn1WRDmK
