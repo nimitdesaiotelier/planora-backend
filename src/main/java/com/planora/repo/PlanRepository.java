@@ -6,8 +6,13 @@ import com.planora.enums.PlanType;
 import java.util.List;
 import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 
 public interface PlanRepository extends JpaRepository<Plan, Long> {
+
+    @Query("select p from Plan p join fetch p.property where p.id = :id")
+    Optional<Plan> findByIdWithProperty(@Param("id") Long id);
 
     List<Plan> findByStatusOrderByIdAsc(PlanStatus propertyId);
 
