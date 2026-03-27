@@ -13,7 +13,6 @@ public record AskPlanRowDto(
         String label,
         /** Line item type (e.g. Revenue / Expense) — “Account type” in the Ask Plan table. */
         String type,
-        String department,
         String category,
         Map<String, Integer> baseValues,
         Integer baseTotal,
