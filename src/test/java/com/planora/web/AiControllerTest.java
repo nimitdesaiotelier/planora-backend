@@ -123,22 +123,8 @@ class AiControllerTest {
     void parseInstructionStillWorks() throws Exception {
         ParsedInstructionDto resp = new ParsedInstructionDto(
                 "Applied change.",
-                List.of(new InstructionStepDto(
-                        "increase",
-                        10,
-                        "percentage",
-                        null,
-                        null,
-                        null,
-                        "Jan",
-                        null,
-                        null,
-                        null,
-                        null,
-                        null)),
-                List.of(),
-                Map.of("Jan", 110),
-                Map.of());
+                List.of(new InstructionStepDto("increase", 10, "percentage", "Jan", null)),
+                Map.of("Jan", 110));
         when(aiParseService.parse(any())).thenReturn(resp);
 
         Map<String, Object> body = Map.of(
