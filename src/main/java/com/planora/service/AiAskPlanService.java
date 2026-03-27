@@ -438,7 +438,6 @@ public class AiAskPlanService {
                 base.getCoaName(),
                 base.getLabel(),
                 base.getType().name(),
-                base.getDepartment(),
                 base.getCategory(),
                 baseValues,
                 baseTotal,
