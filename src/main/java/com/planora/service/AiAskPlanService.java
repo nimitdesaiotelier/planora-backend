@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.planora.domain.ActualsDetails;
 import com.planora.domain.Plan;
 import com.planora.domain.PlanMonthlyDetails;
+import com.planora.enums.PlanStatus;
 import com.planora.enums.PlanType;
 import com.planora.repo.ActualsDetailRepository;
 import com.planora.repo.LineItemRepository;
@@ -16,9 +17,10 @@ import com.planora.web.dto.AskPlanResponse;
 import com.planora.web.dto.AskPlanRowDto;
 import jakarta.persistence.EntityNotFoundException;
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -43,10 +45,13 @@ public class AiAskPlanService {
     private static final int DEFAULT_TOP_N = 25;
     private static final int MAX_TOP_N = 100;
 
+    private static final Pattern COMPARE_WORDS = Pattern.compile(
+            "\\b(compare|vs\\.?|versus|against)\\b", Pattern.CASE_INSENSITIVE);
+
     private static final String SYSTEM_PROMPT = "You are a financial analytics intent parser.\n"
             + "Read a user question and return ONLY JSON using this exact shape:\n"
             + "{\n"
-            + "  \"intent\":\"within_plan|compare_plan|compare_actuals|top_n|filter|unknown\",\n"
+            + "  \"intent\":\"within_plan|compare_plan|compare_actuals|top_n|filter|plan_exists|unknown\",\n"
             + "  \"lineType\":\"Revenue|Expense|Statistics|null\",\n"
             + "  \"lineTypes\":[\"Revenue|Expense|Statistics\", \"...\"],\n"
             + "  \"category\":\"string or null\",\n"
@@ -58,10 +63,14 @@ public class AiAskPlanService {
             + "  \"comparePlanYear\":number or null,\n"
             + "  \"comparePlanType\":\"BUDGET|FORECAST|WHAT_IF|null\",\n"
             + "  \"rankMode\":\"max|min|avg|null\",\n"
-            + "  \"searchText\":\"string or null\"\n"
+            + "  \"searchText\":\"string or null\",\n"
+            + "  \"queryPlanYear\":number or null,\n"
+            + "  \"queryPlanType\":\"BUDGET|FORECAST|WHAT_IF|null\"\n"
             + "}\n"
             + "Rules:\n"
-            + "- Use compare_plan for plan-vs-plan requests.\n"
+            + "- Use plan_exists when the user asks whether a budget/forecast/plan exists for a year (do we have, is there, any plan).\n"
+            + "- Use queryPlanYear and queryPlanType when the user wants analytics for a specific fiscal plan year without comparing (e.g. show statistics for Budget 2025); keep compareMode none.\n"
+            + "- Use compare_plan only when the user explicitly compares plans (compare, vs, versus, against).\n"
             + "- Use compare_actuals for plan-vs-actual requests.\n"
             + "- Use top_n when user asks for top/bottom style ranking.\n"
             + "- Use filter when user asks for constrained subsets (by category/type/text).\n"
@@ -85,25 +94,50 @@ public class AiAskPlanService {
         ParsedAskIntent aiIntent = parseIntent(req.provider(), req.question());
         ParsedAskIntent intent = mergeWithOverrides(aiIntent, req);
 
+        Plan anchorPlan = planRepository.findById(req.basePlanId())
+                .orElseThrow(() -> new EntityNotFoundException("Plan not found: " + req.basePlanId()));
+
+        if ("plan_exists".equals(intent.intent())) {
+            return buildPlanExistsResponse(req, intent, anchorPlan);
+        }
+
         if ("unknown".equals(intent.intent())
                 && intent.topN() == null
                 && (intent.lineTypes() == null || intent.lineTypes().isEmpty())
                 && intent.category() == null
                 && intent.searchText() == null
                 && intent.actualYear() == null
+                && intent.queryPlanYear() == null
                 && !"plan".equals(intent.compareMode())
                 && !"actuals".equals(intent.compareMode())) {
             throw new IllegalArgumentException("Could not understand query intent. Try asking with clearer compare/filter terms.");
         }
 
-        Plan basePlan = planRepository.findById(req.basePlanId())
-                .orElseThrow(() -> new EntityNotFoundException("Plan not found: " + req.basePlanId()));
+        Plan basePlan = anchorPlan;
+        if (intent.queryPlanYear() != null) {
+            PlanType type = parsePlanType(intent.queryPlanType()).orElse(PlanType.BUDGET);
+            Optional<Plan> found = planRepository.findFirstByProperty_IdAndFiscalYearAndPlanTypeOrderByIdAsc(
+                    anchorPlan.getProperty().getId(), intent.queryPlanYear(), type);
+            if (found.isEmpty()) {
+                return buildMissingPlanResponse(req, anchorPlan, intent.queryPlanYear(), type, "query");
+            }
+            basePlan = found.get();
+        }
+
         List<PlanMonthlyDetails> baseRows = lineItemRepository.findByPlan_Id(basePlan.getId());
 
-        Long comparePlanId = resolveComparePlanId(req, intent, basePlan);
-        if ("plan".equals(intent.compareMode()) && comparePlanId == null) {
+        Optional<Long> comparePlanIdOpt = resolveComparePlanIdOptional(req, intent, basePlan);
+        if ("plan".equals(intent.compareMode())
+                && intent.comparePlanYear() != null
+                && comparePlanIdOpt.isEmpty()) {
+            PlanType type = parsePlanType(intent.comparePlanType()).orElse(PlanType.BUDGET);
+            return buildMissingPlanResponse(req, anchorPlan, intent.comparePlanYear(), type, "compare");
+        }
+        Long comparePlanId = comparePlanIdOpt.orElse(null);
+        if ("plan".equals(intent.compareMode()) && comparePlanId == null && req.comparePlanId() == null) {
             throw new IllegalArgumentException("comparePlanId is required (or provide comparePlanYear/comparePlanType).");
         }
+
         Map<String, PlanMonthlyDetails> compareByKey = comparePlanId == null
                 ? Map.of()
                 : lineItemRepository.findByPlan_Id(comparePlanId).stream()
@@ -140,9 +174,12 @@ public class AiAskPlanService {
         appliedFilters.put("comparePlanYear", intent.comparePlanYear());
         appliedFilters.put("comparePlanType", intent.comparePlanType());
         appliedFilters.put("rankMode", normalizeRankMode(intent.rankMode()));
+        appliedFilters.put("queryPlanYear", intent.queryPlanYear());
+        appliedFilters.put("queryPlanType", intent.queryPlanType());
 
         Map<String, Object> meta = new LinkedHashMap<>();
         meta.put("basePlanId", basePlan.getId());
+        meta.put("anchorPlanId", anchorPlan.getId());
         meta.put("comparePlanId", comparePlanId);
         meta.put("actualYear", includeActuals ? actualYear : null);
         meta.put("resultCount", limited.size());
@@ -151,6 +188,149 @@ public class AiAskPlanService {
         String summary = buildSummary(intent, limited.size(), effectiveTopN);
         return new AskPlanResponse(summary, intent.intent(), appliedFilters, limited, meta);
     }
+
+    // ── plan_exists response ────────────────────────────────────────────
+
+    private AskPlanResponse buildPlanExistsResponse(AskPlanRequest req, ParsedAskIntent intent, Plan anchorPlan) {
+        PlanType filterType = parsePlanType(intent.queryPlanType()).orElse(null);
+        Integer year = intent.queryPlanYear();
+        List<Plan> all = planRepository.findByProperty_IdAndStatusOrderByIdAsc(
+                anchorPlan.getProperty().getId(), PlanStatus.ACTIVE);
+
+        List<Plan> matches = new ArrayList<>();
+        for (Plan p : all) {
+            if (filterType != null && p.getPlanType() != filterType) {
+                continue;
+            }
+            if (year != null && !year.equals(p.getFiscalYear())) {
+                continue;
+            }
+            matches.add(p);
+        }
+
+        String summary;
+        if (matches.isEmpty()) {
+            String yPart = year != null ? " for " + year : "";
+            String tPart = filterType != null ? filterType.name().toLowerCase(Locale.ROOT) : "plan";
+            summary = "No, there is no " + tPart + yPart + " on file for this property.";
+        } else {
+            StringBuilder sb = new StringBuilder("Yes! We have ");
+            for (int i = 0; i < matches.size(); i++) {
+                Plan p = matches.get(i);
+                if (i > 0) {
+                    sb.append(i == matches.size() - 1 ? " and " : ", ");
+                }
+                sb.append("\"").append(p.getName()).append("\" (")
+                        .append(p.getPlanType().name())
+                        .append(" ")
+                        .append(p.getFiscalYear())
+                        .append(")");
+            }
+            sb.append(".");
+            summary = sb.toString();
+        }
+
+        Map<String, Object> appliedFilters = baseAppliedFilters(intent);
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("basePlanId", anchorPlan.getId());
+        meta.put("resultCount", 0);
+        meta.put("totalMatchedBeforeLimit", 0);
+        meta.put("suggestedPlans", planSummaries(all));
+        return new AskPlanResponse(summary, "plan_exists", appliedFilters, List.of(), meta);
+    }
+
+    // ── missing plan response (for both query and compare) ──────────────
+
+    private AskPlanResponse buildMissingPlanResponse(
+            AskPlanRequest req,
+            Plan anchorPlan,
+            int year,
+            PlanType planType,
+            String role) {
+        List<Plan> all = planRepository.findByProperty_IdAndStatusOrderByIdAsc(
+                anchorPlan.getProperty().getId(), PlanStatus.ACTIVE);
+        String typeLabel = planType.name().toLowerCase(Locale.ROOT);
+
+        String summary;
+        if ("compare".equals(role)) {
+            summary = "We don't have a "
+                    + typeLabel
+                    + " plan for "
+                    + year
+                    + " to compare with. You can try with one of the available plans below.";
+        } else {
+            summary = "We don't have a "
+                    + typeLabel
+                    + " plan for "
+                    + year
+                    + ". You can try with one of the available plans below.";
+        }
+
+        Map<String, Object> appliedFilters = new LinkedHashMap<>();
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("basePlanId", anchorPlan.getId());
+        meta.put("resultCount", 0);
+        meta.put("totalMatchedBeforeLimit", 0);
+        meta.put("missingPlanYear", year);
+        meta.put("missingPlanType", planType.name());
+        meta.put("missingRole", role);
+        meta.put("suggestedPlans", planSummaries(all));
+        return new AskPlanResponse(summary, "plan_not_found", appliedFilters, List.of(), meta);
+    }
+
+    // ── shared helpers ──────────────────────────────────────────────────
+
+    private static Map<String, Object> baseAppliedFilters(ParsedAskIntent intent) {
+        Map<String, Object> af = new LinkedHashMap<>();
+        af.put("period", normalizePeriod(intent.period()));
+        af.put("lineTypes", intent.lineTypes());
+        af.put("category", intent.category());
+        af.put("searchText", intent.searchText());
+        af.put("topN", intent.topN());
+        af.put("compareMode", intent.compareMode());
+        af.put("includeActuals", intent.includeActuals());
+        af.put("actualYear", intent.actualYear());
+        af.put("comparePlanYear", intent.comparePlanYear());
+        af.put("comparePlanType", intent.comparePlanType());
+        af.put("rankMode", normalizeRankMode(intent.rankMode()));
+        af.put("queryPlanYear", intent.queryPlanYear());
+        af.put("queryPlanType", intent.queryPlanType());
+        return af;
+    }
+
+    private static List<Map<String, Object>> planSummaries(List<Plan> plans) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Plan p : plans) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", p.getId());
+            m.put("name", p.getName());
+            m.put("fiscalYear", p.getFiscalYear());
+            m.put("planType", p.getPlanType().name());
+            out.add(m);
+        }
+        return out;
+    }
+
+    // ── resolve base/compare plans ──────────────────────────────────────
+
+    private Optional<Long> resolveComparePlanIdOptional(AskPlanRequest req, ParsedAskIntent intent, Plan basePlan) {
+        if (req.comparePlanId() != null) {
+            return Optional.of(req.comparePlanId());
+        }
+        if (!"plan".equals(intent.compareMode())) {
+            return Optional.empty();
+        }
+        if (intent.comparePlanYear() == null) {
+            return Optional.empty();
+        }
+        PlanType type = parsePlanType(intent.comparePlanType()).orElse(PlanType.BUDGET);
+        return planRepository
+                .findFirstByProperty_IdAndFiscalYearAndPlanTypeOrderByIdAsc(
+                        basePlan.getProperty().getId(), intent.comparePlanYear(), type)
+                .map(Plan::getId);
+    }
+
+    // ── sorter / row building / actuals ─────────────────────────────────
 
     private Comparator<AskPlanRowDto> sorter(ParsedAskIntent intent) {
         List<String> months = monthsForPeriod(normalizePeriod(intent.period()));
@@ -328,24 +508,7 @@ public class AiAskPlanService {
         return base + " Returned " + count + " row(s), capped at top " + topN + ".";
     }
 
-    private Long resolveComparePlanId(AskPlanRequest req, ParsedAskIntent intent, Plan basePlan) {
-        if (req.comparePlanId() != null) {
-            return req.comparePlanId();
-        }
-        if (!"plan".equals(intent.compareMode())) {
-            return null;
-        }
-        if (intent.comparePlanYear() == null) {
-            return null;
-        }
-        PlanType type = parsePlanType(intent.comparePlanType()).orElse(PlanType.BUDGET);
-        return planRepository
-                .findFirstByProperty_IdAndFiscalYearAndPlanTypeOrderByIdAsc(
-                        basePlan.getProperty().getId(), intent.comparePlanYear(), type)
-                .map(Plan::getId)
-                .orElseThrow(() -> new IllegalArgumentException(
-                        "No " + type + " plan found for year " + intent.comparePlanYear()));
-    }
+    // ── intent parsing ──────────────────────────────────────────────────
 
     private ParsedAskIntent parseIntent(String provider, String question) {
         if (question == null || question.isBlank()) {
@@ -451,6 +614,8 @@ public class AiAskPlanService {
         String comparePlanType = text(n, "comparePlanType");
         String rankMode = text(n, "rankMode");
         String searchText = text(n, "searchText");
+        Integer queryPlanYear = intVal(n, "queryPlanYear");
+        String queryPlanType = text(n, "queryPlanType");
         return new ParsedAskIntent(
                 blankToNull(intent),
                 normalizeLineTypes(lineTypes, lineType),
@@ -463,26 +628,55 @@ public class AiAskPlanService {
                 comparePlanYear,
                 normalizePlanType(comparePlanType),
                 normalizeRankMode(rankMode),
-                blankToNull(searchText));
+                blankToNull(searchText),
+                queryPlanYear,
+                normalizePlanType(queryPlanType));
     }
 
     static ParsedAskIntent heuristicIntent(String q) {
         String s = Optional.ofNullable(q).orElse("").toLowerCase(Locale.ROOT);
+
         String intent = "within_plan";
         String compareMode = "none";
         Integer actualYear = null;
         Integer comparePlanYear = null;
         String comparePlanType = null;
+        Integer queryPlanYear = null;
+        String queryPlanTypeStr = null;
         String rankMode = inferRankMode(s);
-        if (s.contains("compare") && s.contains("actual")) {
+
+        boolean asksExistence =
+                (s.contains("do we have") || s.contains("is there") || s.contains("are there")
+                        || s.contains("do i have") || s.contains("have any") || s.contains("any plan"))
+                        && (s.contains("budget") || s.contains("forecast") || s.contains("plan"));
+
+        boolean wantCompare = COMPARE_WORDS.matcher(s).find();
+
+        if (asksExistence) {
+            intent = "plan_exists";
+            queryPlanYear = extractYearNearKeyword(s, "budget");
+            if (queryPlanYear == null) {
+                queryPlanYear = extractYearNearKeyword(s, "forecast");
+            }
+            if (queryPlanYear == null) {
+                queryPlanYear = extractAnyFiscalYear(s);
+            }
+            queryPlanTypeStr = inferPlanTypeFromKeywords(s);
+        } else if (wantCompare && s.contains("actual")) {
             intent = "compare_actuals";
             compareMode = "actuals";
             actualYear = extractYearNearKeyword(s, "actual");
-        } else if (s.contains("compare")) {
+        } else if (wantCompare) {
             intent = "compare_plan";
             compareMode = "plan";
             comparePlanYear = extractYearNearKeyword(s, "budget");
-            comparePlanType = comparePlanYear != null || s.contains("budget") ? "BUDGET" : null;
+            if (comparePlanYear == null) {
+                comparePlanYear = extractYearNearKeyword(s, "forecast");
+            }
+            if (comparePlanYear == null) {
+                comparePlanYear = extractAnyFiscalYear(s);
+            }
+            comparePlanType = inferPlanTypeFromKeywords(s);
         } else if (s.contains("top ")) {
             intent = "top_n";
         } else if (s.contains("show") || s.contains("filter")) {
@@ -490,15 +684,28 @@ public class AiAskPlanService {
         } else {
             intent = "unknown";
         }
-        if (s.contains("actual")) {
+
+        if (s.contains("actual") && !"compare_actuals".equals(intent)) {
             actualYear = actualYear != null ? actualYear : extractYearNearKeyword(s, "actual");
         }
-        if (s.contains("budget")) {
-            comparePlanYear = comparePlanYear != null ? comparePlanYear : extractYearNearKeyword(s, "budget");
-            comparePlanType = comparePlanType != null ? comparePlanType : "BUDGET";
-            compareMode = Objects.equals(compareMode, "none") ? "plan" : compareMode;
-            intent = Objects.equals(intent, "within_plan") || Objects.equals(intent, "filter") ? "compare_plan" : intent;
+
+        if (!wantCompare && !asksExistence) {
+            if (s.contains("budget")) {
+                Integer y = extractYearNearKeyword(s, "budget");
+                if (y != null) {
+                    queryPlanYear = y;
+                    queryPlanTypeStr = "BUDGET";
+                }
+            }
+            if (queryPlanYear == null && s.contains("forecast")) {
+                Integer y = extractYearNearKeyword(s, "forecast");
+                if (y != null) {
+                    queryPlanYear = y;
+                    queryPlanTypeStr = "FORECAST";
+                }
+            }
         }
+
         List<String> lineTypes = normalizeLineTypes(List.of(
                 s.contains("revenue") ? "Revenue" : null,
                 s.contains("expense") ? "Expense" : null,
@@ -509,7 +716,38 @@ public class AiAskPlanService {
             topN = 1;
         }
         return new ParsedAskIntent(
-                intent, lineTypes, null, null, topN, null, compareMode, actualYear, comparePlanYear, comparePlanType, rankMode, searchText);
+                intent,
+                lineTypes,
+                null,
+                null,
+                topN,
+                null,
+                compareMode,
+                actualYear,
+                comparePlanYear,
+                comparePlanType,
+                rankMode,
+                searchText,
+                queryPlanYear,
+                queryPlanTypeStr);
+    }
+
+    private static String inferPlanTypeFromKeywords(String s) {
+        if (s.contains("forecast")) {
+            return "FORECAST";
+        }
+        if (s.contains("what if") || s.contains("what-if")) {
+            return "WHAT_IF";
+        }
+        return "BUDGET";
+    }
+
+    static Integer extractAnyFiscalYear(String text) {
+        if (text == null) {
+            return null;
+        }
+        Matcher m = Pattern.compile("\\b(20\\d{2})\\b").matcher(text);
+        return m.find() ? Integer.parseInt(m.group(1)) : null;
     }
 
     static Integer extractTopN(String s) {
@@ -551,8 +789,12 @@ public class AiAskPlanService {
                 req.comparePlanYear() != null ? req.comparePlanYear() : ai.comparePlanYear(),
                 coalesce(normalizePlanType(req.comparePlanType()), ai.comparePlanType()),
                 ai.rankMode(),
-                coalesce(blankToNull(req.searchText()), ai.searchText()));
+                coalesce(blankToNull(req.searchText()), ai.searchText()),
+                req.queryPlanYear() != null ? req.queryPlanYear() : ai.queryPlanYear(),
+                coalesce(normalizePlanType(req.queryPlanType()), ai.queryPlanType()));
     }
+
+    // ── generic utilities ───────────────────────────────────────────────
 
     private static <T> T coalesce(T a, T b) {
         return a != null ? a : b;
@@ -750,6 +992,8 @@ public class AiAskPlanService {
         return s == null || s.isBlank() || "null".equalsIgnoreCase(s) ? null : s.trim();
     }
 
+    // ── intent record ───────────────────────────────────────────────────
+
     record ParsedAskIntent(
             String intent,
             List<String> lineTypes,
@@ -762,9 +1006,12 @@ public class AiAskPlanService {
             Integer comparePlanYear,
             String comparePlanType,
             String rankMode,
-            String searchText) {
+            String searchText,
+            Integer queryPlanYear,
+            String queryPlanType) {
         static ParsedAskIntent empty() {
-            return new ParsedAskIntent(null, null, null, null, null, null, null, null, null, null, null, null);
+            return new ParsedAskIntent(
+                    null, null, null, null, null, null, null, null, null, null, null, null, null, null);
         }
 
         boolean isEmpty() {
@@ -779,7 +1026,9 @@ public class AiAskPlanService {
                     && comparePlanYear == null
                     && comparePlanType == null
                     && rankMode == null
-                    && searchText == null;
+                    && searchText == null
+                    && queryPlanYear == null
+                    && queryPlanType == null;
         }
     }
 }

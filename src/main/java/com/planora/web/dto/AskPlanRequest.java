@@ -9,9 +9,9 @@ import java.util.List;
 public record AskPlanRequest(
         /** "openai" or "gemini" */
         @NotBlank String provider,
-        /** Natural language query from user */
+        /** Natural language query from the user */
         @NotBlank String question,
-        /** Base plan to query */
+        /** Base plan to query (property context; may be overridden by queryPlanYear) */
         @NotNull Long basePlanId,
         /** Optional plan for comparison */
         Long comparePlanId,
@@ -34,4 +34,18 @@ public record AskPlanRequest(
         /** Optional explicit search text override */
         String searchText,
         /** Optional category filter (contains, case-insensitive) */
-        String category) {}
+        String category,
+        /** Optional department filter (contains, case-insensitive) */
+        String department,
+        /** Optional COA code filter (contains, case-insensitive) */
+        String coaCode,
+        /** Optional COA name filter (contains, case-insensitive) */
+        String coaName,
+        /** Optional: any | zero | non_zero — base plan values over period or totalFilterMonths */
+        String totalFilter,
+        /** Optional month keys for total filter sum (e.g. Feb, Apr); overrides period when non-empty */
+        List<String> totalFilterMonths,
+        /** When set, use this fiscal year's plan as the data source instead of basePlanId (same property). */
+        Integer queryPlanYear,
+        /** BUDGET | FORECAST | WHAT_IF — pairs with queryPlanYear */
+        String queryPlanType) {}
