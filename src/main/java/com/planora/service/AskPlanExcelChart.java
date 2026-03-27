@@ -30,10 +30,22 @@ final class AskPlanExcelChart {
 
     private static final int MAX_SERIES_TITLE_LEN = 250;
 
+    /** Anchor height in rows (see {@link #addMonthlyLineChartPerLineItem} {@code XSSFClientAnchor} row2 offset). */
+    static final int CHART_ANCHOR_ROW_SPAN = 16;
+
     /** Hidden sheet holding month × line-item formulas so the Result sheet stays table + chart only. */
     private static final String CHART_DATA_SHEET = "ChartData";
 
     private AskPlanExcelChart() {}
+
+    /**
+     * First sheet row index below the monthly line chart (and a small gap), for appending content such as analysis.
+     * Must match {@link #addMonthlyLineChartPerLineItem} anchor placement ({@code chartTopRow = totalRowIndex + 2}).
+     */
+    static int firstRowBelowMonthlyChart(int totalRowIndex) {
+        int chartTopRow = totalRowIndex + 2;
+        return chartTopRow + CHART_ANCHOR_ROW_SPAN + 2;
+    }
 
     static void addMonthlyLineChartPerLineItem(
             XSSFSheet resultSheet,
@@ -58,7 +70,7 @@ final class AskPlanExcelChart {
         int chartCol = 0;
         XSSFDrawing drawing = resultSheet.createDrawingPatriarch();
         XSSFClientAnchor anchor =
-                new XSSFClientAnchor(0, 0, 0, 0, chartCol, chartTopRow, chartCol + 12, chartTopRow + 16);
+                new XSSFClientAnchor(0, 0, 0, 0, chartCol, chartTopRow, chartCol + 12, chartTopRow + CHART_ANCHOR_ROW_SPAN);
         XSSFChart chart = drawing.createChart(anchor);
         chart.setTitleText("Monthly base by line item");
 

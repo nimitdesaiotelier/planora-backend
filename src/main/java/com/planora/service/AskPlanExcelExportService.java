@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import lombok.RequiredArgsConstructor;
 import org.apache.poi.ss.usermodel.BorderStyle;
@@ -118,6 +119,17 @@ public class AskPlanExcelExportService {
             if (includeChart && !rows.isEmpty()) {
                 AskPlanExcelChart.addMonthlyLineChartPerLineItem(
                         sheet, useBaseActualMonthLayout(flags), dataStart, rows, totalRowIndex);
+            }
+
+            List<String> analysisPoints = request.analysisPoints();
+            if (analysisPoints != null && !analysisPoints.isEmpty()) {
+                int analysisStartRow;
+                if (includeChart && !rows.isEmpty()) {
+                    analysisStartRow = AskPlanExcelChart.firstRowBelowMonthlyChart(totalRowIndex);
+                } else {
+                    analysisStartRow = totalRowIndex + 2;
+                }
+                writeAnalysisSection(sheet, wb, analysisStartRow, analysisPoints, headerCols);
             }
 
             byte[] bytes = toBytes(wb);
@@ -660,6 +672,56 @@ public class AskPlanExcelExportService {
 
         long deltaActualSum() {
             return deltaActual;
+        }
+    }
+
+    private static void writeAnalysisSection(
+            XSSFSheet sheet,
+            XSSFWorkbook wb,
+            int startRow,
+            List<String> points,
+            int headerColCount) {
+        List<String> cleaned =
+                points.stream().filter(Objects::nonNull).map(String::trim).filter(s -> !s.isEmpty()).toList();
+        if (cleaned.isEmpty()) {
+            return;
+        }
+        int lastCol = Math.max(0, headerColCount - 1);
+
+        Font titleFont = wb.createFont();
+        titleFont.setBold(true);
+        titleFont.setFontHeightInPoints((short) 11);
+        CellStyle titleStyle = wb.createCellStyle();
+        titleStyle.setFont(titleFont);
+        titleStyle.setWrapText(true);
+        titleStyle.setVerticalAlignment(VerticalAlignment.TOP);
+        titleStyle.setAlignment(HorizontalAlignment.LEFT);
+
+        Font bodyFont = wb.createFont();
+        CellStyle bodyStyle = wb.createCellStyle();
+        bodyStyle.setFont(bodyFont);
+        bodyStyle.setWrapText(true);
+        bodyStyle.setVerticalAlignment(VerticalAlignment.TOP);
+        bodyStyle.setAlignment(HorizontalAlignment.LEFT);
+
+        int r = startRow;
+        Row titleRow = sheet.createRow(r++);
+        Cell titleCell = titleRow.createCell(0);
+        titleCell.setCellValue("Analysis");
+        titleCell.setCellStyle(titleStyle);
+        if (lastCol > 0) {
+            sheet.addMergedRegion(new CellRangeAddress(startRow, startRow, 0, lastCol));
+        }
+
+        for (String p : cleaned) {
+            int rowIdx = r++;
+            Row pr = sheet.createRow(rowIdx);
+            Cell c = pr.createCell(0);
+            c.setCellValue("• " + p);
+            c.setCellStyle(bodyStyle);
+            if (lastCol > 0) {
+                sheet.addMergedRegion(new CellRangeAddress(rowIdx, rowIdx, 0, lastCol));
+            }
         }
     }
 }

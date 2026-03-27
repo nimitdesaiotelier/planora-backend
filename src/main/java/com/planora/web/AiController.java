@@ -3,6 +3,8 @@ package com.planora.web;
 import com.planora.service.AiParseService;
 import com.planora.service.AiAskPlanService;
 import com.planora.service.AskPlanExcelExportService;
+import com.planora.web.dto.AskPlanAnalyzeRequest;
+import com.planora.web.dto.AskPlanAnalyzeResponse;
 import com.planora.web.dto.AskPlanExcelExportRequest;
 import com.planora.web.dto.AskPlanExcelExportResult;
 import com.planora.web.dto.AskPlanRequest;
@@ -50,6 +52,22 @@ public class AiController {
     public ResponseEntity<?> askPlan(@Valid @RequestBody AskPlanRequest body) {
         try {
             AskPlanResponse dto = aiAskPlanService.ask(body);
+            return ResponseEntity.ok(dto);
+        } catch (IllegalStateException e) {
+            return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .body(Map.of("error", e.getMessage()));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    /**
+     * Short AI summary (1–5 bullet points) for the result rows currently shown in Ask Plan, using the same provider as the query.
+     */
+    @PostMapping("/ask-plan/analyze")
+    public ResponseEntity<?> analyzeAskPlan(@Valid @RequestBody AskPlanAnalyzeRequest body) {
+        try {
+            AskPlanAnalyzeResponse dto = aiAskPlanService.analyze(body);
             return ResponseEntity.ok(dto);
         } catch (IllegalStateException e) {
             return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
