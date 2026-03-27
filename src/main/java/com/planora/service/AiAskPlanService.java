@@ -74,7 +74,8 @@ public class AiAskPlanService {
             + "  \"queryPlanYear\":number or null,\n"
             + "  \"queryPlanType\":\"BUDGET|FORECAST|WHAT_IF|null\",\n"
             + "  \"totalFilter\":\"any|zero|non_zero|null\",\n"
-            + "  \"groupBy\":\"department|category|type|null\"\n"
+            + "  \"groupBy\":\"department|category|type|null\",\n"
+            + "  \"chartType\":\"bar|pie|line|null\"\n"
             + "}\n"
             + "Rules:\n"
             + "- Extract department, coaCode, coaName when user mentions department name, GL/COA code, or account name.\n"
@@ -90,6 +91,7 @@ public class AiAskPlanService {
             + "- Use top_n when user asks for top/bottom style ranking.\n"
             + "- Use filter when user asks for constrained subsets (by category/type/text).\n"
             + "- Use groupBy when user asks for totals/breakdown by department, category, or account type.\n"
+            + "- Set chartType when user asks for a chart, graph, plot, or visualization. Use \"bar\" for comparisons, \"pie\" for proportions/shares, \"line\" for trends over time. Default to \"line\" if chart is requested but type is unclear.\n"
             + "- If unclear, use unknown.\n"
             + "Respond with valid JSON only.";
     }
@@ -237,6 +239,10 @@ public class AiAskPlanService {
             meta.put("groupedTotals", grouped);
             meta.put("groupBy", intent.groupBy());
         }
+
+        // TODO: re-enable chart support after improving AI prompt accuracy
+        meta.put("isChart", false);
+        meta.put("chartType", null);
 
         String summary = buildSummary(intent, limited.size(), effectiveTopN);
         return new AskPlanResponse(summary, intent.intent(), appliedFilters, limited, meta);
@@ -862,6 +868,7 @@ public class AiAskPlanService {
         String queryPlanType = text(n, "queryPlanType");
         String totalFilter = text(n, "totalFilter");
         String groupBy = text(n, "groupBy");
+        String chartType = text(n, "chartType");
         return new ParsedAskIntent(
                 blankToNull(intent),
                 normalizeLineTypes(lineTypes, lineType),
@@ -882,7 +889,8 @@ public class AiAskPlanService {
                 normalizePlanType(queryPlanType),
                 blankToNull(totalFilter),
                 null,
-                blankToNull(groupBy));
+                blankToNull(groupBy),
+                normalizeChartType(blankToNull(chartType)));
     }
 
     static ParsedAskIntent heuristicIntent(String q) {
@@ -978,6 +986,13 @@ public class AiAskPlanService {
 
         String groupBy = inferGroupBy(s);
 
+        String chartType = null;
+        if (s.contains("chart") || s.contains("graph") || s.contains("plot") || s.contains("visuali")) {
+            if (s.contains("bar")) chartType = "bar";
+            else if (s.contains("pie")) chartType = "pie";
+            else chartType = "line";
+        }
+
         List<String> lineTypes = normalizeLineTypes(List.of(
                 s.contains("revenue") ? "Revenue" : null,
                 s.contains("expense") ? "Expense" : null,
@@ -1010,7 +1025,8 @@ public class AiAskPlanService {
                 queryPlanTypeStr,
                 null,
                 null,
-                groupBy);
+                groupBy,
+                chartType);
     }
 
     static Integer resolveRelativeYear(String text) {
@@ -1059,7 +1075,8 @@ public class AiAskPlanService {
                 compareMode, actualYear, comparePlanYear,
                 intent.comparePlanType(), intent.rankMode(), intent.searchText(),
                 queryPlanYear, intent.queryPlanType(),
-                intent.totalFilter(), intent.totalFilterMonths(), intent.groupBy());
+                intent.totalFilter(), intent.totalFilterMonths(), intent.groupBy(),
+                intent.chartType());
     }
 
     private static String inferGroupBy(String s) {
@@ -1218,7 +1235,8 @@ public class AiAskPlanService {
                 coalesce(blankToNull(req.totalFilter()), ai.totalFilter()),
                 req.totalFilterMonths() != null && !req.totalFilterMonths().isEmpty()
                         ? req.totalFilterMonths() : ai.totalFilterMonths(),
-                ai.groupBy());
+                ai.groupBy(),
+                ai.chartType());
     }
 
     // ── generic utilities ───────────────────────────────────────────────
@@ -1271,6 +1289,13 @@ public class AiAskPlanService {
         if (editDistance(lt, "revenue") <= 2 || editDistance(lt, "revenues") <= 2) return "Revenue";
         if (editDistance(lt, "statistics") <= 2 || editDistance(lt, "statistic") <= 2) return "Statistics";
         return null;
+    }
+
+    private static String normalizeChartType(String ct) {
+        if (ct == null) return null;
+        String c = ct.trim().toLowerCase(Locale.ROOT);
+        if ("bar".equals(c) || "pie".equals(c) || "line".equals(c)) return c;
+        return "line";
     }
 
     private static String normalizeCompareMode(String compareMode) {
@@ -1460,11 +1485,12 @@ public class AiAskPlanService {
             String queryPlanType,
             String totalFilter,
             List<String> totalFilterMonths,
-            String groupBy) {
+            String groupBy,
+            String chartType) {
         static ParsedAskIntent empty() {
             return new ParsedAskIntent(
                     null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null,
-                    null, null, null, null);
+                    null, null, null, null, null);
         }
 
         boolean isEmpty() {
@@ -1487,7 +1513,8 @@ public class AiAskPlanService {
                     && queryPlanType == null
                     && totalFilter == null
                     && (totalFilterMonths == null || totalFilterMonths.isEmpty())
-                    && groupBy == null;
+                    && groupBy == null
+                    && chartType == null;
         }
     }
 }
