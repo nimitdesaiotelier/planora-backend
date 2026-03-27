@@ -199,6 +199,9 @@ public class AiAskPlanService {
         Integer deltaVsActual = actualTotal == null ? null : (baseTotal - actualTotal);
         return new AskPlanRowDto(
                 base.getLineKey(),
+                base.getDepartment(),
+                base.getCoaCode(),
+                base.getCoaName(),
                 base.getLabel(),
                 base.getType().name(),
                 base.getCategory(),
