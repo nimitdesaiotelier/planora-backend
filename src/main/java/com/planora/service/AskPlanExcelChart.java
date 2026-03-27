@@ -99,7 +99,10 @@ final class AskPlanExcelChart {
     }
 
     private static String seriesTitle(AskPlanRowDto row, int index) {
-        String label = row.label();
+        String label = row.coaName();
+        if (label == null || label.isBlank()) {
+            label = row.label();
+        }
         if (label == null || label.isBlank()) {
             label = "Line " + (index + 1);
         }
@@ -135,7 +138,8 @@ final class AskPlanExcelChart {
             int excelDataRow = dataStartRow0 + i + 1;
             for (int m = 0; m < 12; m++) {
                 XSSFRow row = helperSheet.getRow(helperMonthStartRow + m);
-                int colRef = baseActualMonthLayout ? (4 + 2 * m) : (3 + m);
+                // First month “base” column: 5 descriptor cols, then Jan base (see AskPlanExcelExportService).
+                int colRef = baseActualMonthLayout ? (5 + 2 * m) : (5 + m);
                 String colLetter = CellReference.convertNumToColString(colRef);
                 row.createCell(1 + i).setCellFormula(refPrefix + colLetter + excelDataRow);
             }
