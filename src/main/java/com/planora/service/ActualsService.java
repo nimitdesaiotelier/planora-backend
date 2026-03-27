@@ -32,6 +32,11 @@ public class ActualsService {
     private final ActualsExcelParser actualsExcelParser;
 
     @Transactional(readOnly = true)
+    public List<Integer> listYearsWithData(long propertyId, long organizationId) {
+        return actualsDetailRepository.findDistinctYearsByPropertyIdAndOrganizationId(propertyId, organizationId);
+    }
+
+    @Transactional(readOnly = true)
     public List<ActualsDetailDto> list(int year, long propertyId, long organizationId) {
         List<ActualsDetails> rows = actualsDetailRepository
                 .findByYearAndProperty_IdAndOrganizationIdOrderByCoaCodeAsc(year, propertyId, organizationId);
