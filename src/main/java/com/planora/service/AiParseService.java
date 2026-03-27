@@ -246,7 +246,7 @@ public class AiParseService {
         log.debug("AI parsed steps: {}", steps);
 
         if (steps.isEmpty()) {
-            throw new IllegalStateException("AI returned no instructions — try rephrasing.");
+            throw new IllegalStateException("Could not interpret your request — please refine the prompt");
         }
 
         Set<String> warnings = new LinkedHashSet<>();
