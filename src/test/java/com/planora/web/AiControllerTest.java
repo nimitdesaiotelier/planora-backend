@@ -136,7 +136,9 @@ class AiControllerTest {
                         null,
                         null,
                         null)),
-                Map.of("Jan", 110));
+                List.of(),
+                Map.of("Jan", 110),
+                Map.of());
         when(aiParseService.parse(any())).thenReturn(resp);
 
         Map<String, Object> body = Map.of(

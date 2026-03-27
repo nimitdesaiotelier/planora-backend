@@ -1,10 +1,10 @@
-# Build — cache dependencies in their own layer so only code changes recompile
+# Build — only src/main (no tests in image)
 FROM maven:3.9.9-eclipse-temurin-21-alpine AS build
 WORKDIR /app
 COPY pom.xml .
-RUN mvn -q -B -DskipTests dependency:go-offline
-COPY src ./src
-RUN mvn -q -B -DskipTests package
+RUN mvn -q -B -Dmaven.test.skip=true dependency:go-offline
+COPY src/main ./src/main
+RUN mvn -q -B -Dmaven.test.skip=true package
 
 # Run
 FROM eclipse-temurin:21-jre-alpine
