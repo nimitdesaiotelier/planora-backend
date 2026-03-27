@@ -240,10 +240,9 @@ public class AiAskPlanService {
             meta.put("groupBy", intent.groupBy());
         }
 
-        if (intent.chartType() != null) {
-            meta.put("isChart", true);
-            meta.put("chartType", intent.chartType());
-        }
+        // TODO: re-enable chart support after improving AI prompt accuracy
+        meta.put("isChart", false);
+        meta.put("chartType", null);
 
         String summary = buildSummary(intent, limited.size(), effectiveTopN);
         return new AskPlanResponse(summary, intent.intent(), appliedFilters, limited, meta);
