@@ -12,6 +12,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.planora.service.AiAskPlanService;
 import com.planora.service.AiParseService;
 import com.planora.service.AskPlanExcelExportService;
+import com.planora.web.dto.AskPlanAnalyzeRequest;
+import com.planora.web.dto.AskPlanAnalyzeResponse;
 import com.planora.web.dto.AskPlanExcelExportRequest;
 import com.planora.web.dto.AskPlanExcelExportResult;
 import com.planora.web.dto.AskPlanResponse;
@@ -85,13 +87,30 @@ class AiControllerTest {
     }
 
     @Test
+    void analyzeAskPlanReturns200() throws Exception {
+        AskPlanResponse resp = new AskPlanResponse(
+                "summary", "top_n", Map.of("topN", 5), List.of(), Map.of("resultCount", 0));
+        when(aiAskPlanService.analyze(any()))
+                .thenReturn(new AskPlanAnalyzeResponse(List.of("Point one.", "Point two.")));
+
+        AskPlanAnalyzeRequest body = new AskPlanAnalyzeRequest("openai", "show top 5", resp);
+
+        mockMvc.perform(post("/api/ai/ask-plan/analyze")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(body)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.points[0]").value("Point one."))
+                .andExpect(jsonPath("$.points[1]").value("Point two."));
+    }
+
+    @Test
     void exportAskPlanExcelReturns200() throws Exception {
         when(askPlanExcelExportService.export(any()))
                 .thenReturn(new AskPlanExcelExportResult(new byte[] {80, 75, 3, 4}, "ask-plan-export.xlsx"));
 
         AskPlanResponse resp = new AskPlanResponse(
                 "summary", "filter", Map.of("compareMode", "none"), List.of(), Map.of("resultCount", 0));
-        AskPlanExcelExportRequest exportBody = new AskPlanExcelExportRequest(resp, null, null, null, null, false);
+        AskPlanExcelExportRequest exportBody = new AskPlanExcelExportRequest(resp, null, null, null, null, false, null);
 
         mockMvc.perform(post("/api/ai/ask-plan/export-xlsx")
                         .contentType(MediaType.APPLICATION_JSON)

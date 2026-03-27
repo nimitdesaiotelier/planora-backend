@@ -1,6 +1,7 @@
 package com.planora.web.dto;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import java.util.List;
 
 /**
  * Excel export payload: primarily {@link #response}. Title rows and the download filename are resolved on the server
@@ -15,4 +16,6 @@ public record AskPlanExcelExportRequest(
         String fiscalYearLabel,
         String propertyName,
         /** When true, the workbook includes a line chart (months on X, totals on Y). */
-        Boolean includeChart) {}
+        Boolean includeChart,
+        /** Optional AI analysis bullets (same as Ask Plan UI); placed after chart if present, else after the table. */
+        List<String> analysisPoints) {}
