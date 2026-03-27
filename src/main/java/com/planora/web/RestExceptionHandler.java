@@ -1,5 +1,6 @@
 package com.planora.web;
 
+import com.planora.service.DuplicateActivePlanException;
 import jakarta.persistence.EntityNotFoundException;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -23,6 +24,14 @@ public class RestExceptionHandler {
     public ResponseEntity<Map<String, String>> conflict(IllegalStateException ex) {
         return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(Map.of("error", ex.getMessage()));
+    }
+
+    @ExceptionHandler(DuplicateActivePlanException.class)
+    public ResponseEntity<Map<String, Object>> duplicatePlan(DuplicateActivePlanException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(Map.of(
+                        "error", ex.getMessage(),
+                        "existingPlanId", ex.getExistingPlanId()));
     }
 
     @ExceptionHandler(IllegalArgumentException.class)

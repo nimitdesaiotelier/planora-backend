@@ -58,6 +58,15 @@ public class PlanService {
         Property property = propertyRepository.findById(req.propertyId())
                 .orElseThrow(() -> new EntityNotFoundException("Property not found: " + req.propertyId()));
 
+        planRepository
+                .findFirstByProperty_IdAndFiscalYearAndPlanTypeAndStatusOrderByIdAsc(
+                        req.propertyId(), req.fiscalYear(), req.planType(), PlanStatus.ACTIVE)
+                .ifPresent(existing -> {
+                    String message = "An active %s plan already exists for %s FY %d."
+                            .formatted(req.planType().name(), property.getName(), req.fiscalYear());
+                    throw new DuplicateActivePlanException(message, existing.getId());
+                });
+
         Plan p = new Plan();
         p.setName("%s FY %d - %s".formatted(
                 req.planType().name(), req.fiscalYear(), property.getName()));
