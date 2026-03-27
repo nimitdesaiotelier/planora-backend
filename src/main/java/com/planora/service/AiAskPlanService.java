@@ -12,6 +12,8 @@ import com.planora.enums.PlanType;
 import com.planora.repo.ActualsDetailRepository;
 import com.planora.repo.LineItemRepository;
 import com.planora.repo.PlanRepository;
+import com.planora.web.dto.AskPlanAnalyzeRequest;
+import com.planora.web.dto.AskPlanAnalyzeResponse;
 import com.planora.web.dto.AskPlanRequest;
 import com.planora.web.dto.AskPlanResponse;
 import com.planora.web.dto.AskPlanRowDto;
@@ -93,6 +95,16 @@ public class AiAskPlanService {
             + "- If unclear, use unknown.\n"
             + "Respond with valid JSON only.";
     }
+
+    private static final String ANALYSIS_SYSTEM_PROMPT =
+            "You are a concise financial analyst for hotel budget line items.\n"
+                    + "Given the user's question and a JSON object with result rows (labels, base totals, optional compare/actual deltas), "
+                    + "write a very short analysis.\n"
+                    + "Respond with ONLY valid JSON of this exact shape: {\"points\":[\"...\",\"...\"]}\n"
+                    + "Rules:\n"
+                    + "- The \"points\" array must contain between 1 and 5 strings.\n"
+                    + "- Each string is one short factual sentence (no markdown, no bullet characters, no numbering prefix).\n"
+                    + "- Focus on largest line items, revenue vs expense mix, and notable variances when compare or actual fields are present.\n";
 
     private final ObjectMapper objectMapper;
     private final PlanRepository planRepository;
@@ -428,6 +440,9 @@ public class AiAskPlanService {
 
         return new AskPlanRowDto(
                 base.getLineKey(),
+                base.getDepartment(),
+                base.getCoaCode(),
+                base.getCoaName(),
                 base.getLabel(),
                 base.getType().name(),
                 base.getDepartment(),
@@ -685,6 +700,150 @@ public class AiAskPlanService {
         } catch (Exception e) {
             throw new IllegalStateException("Gemini response parse failed: " + e.getMessage(), e);
         }
+    }
+
+    public AskPlanAnalyzeResponse analyze(AskPlanAnalyzeRequest req) {
+        AskPlanResponse resp = req.response();
+        if (resp == null || resp.resultRows() == null || resp.resultRows().isEmpty()) {
+            throw new IllegalArgumentException("No result rows to analyze");
+        }
+        String provider = Optional.ofNullable(req.provider()).orElse("").toLowerCase(Locale.ROOT).trim();
+        String userPayload = buildAnalysisUserPayload(req.question(), resp);
+        JsonNode root;
+        if ("openai".equals(provider)) {
+            root = fetchAnalysisJsonOpenAi(userPayload);
+        } else if ("gemini".equals(provider)) {
+            root = fetchAnalysisJsonGemini(userPayload);
+        } else {
+            throw new IllegalArgumentException("provider must be 'openai' or 'gemini'");
+        }
+        return toAnalyzeResponse(root);
+    }
+
+    private String buildAnalysisUserPayload(String question, AskPlanResponse resp) {
+        try {
+            ObjectNode root = objectMapper.createObjectNode();
+            root.put("userQuestion", question);
+            root.put("summary", resp.summary());
+            root.put("intent", resp.intent());
+            if (resp.appliedFilters() != null) {
+                root.set("appliedFilters", objectMapper.valueToTree(resp.appliedFilters()));
+            }
+            ArrayNode rows = objectMapper.createArrayNode();
+            for (AskPlanRowDto r : resp.resultRows()) {
+                ObjectNode o = objectMapper.createObjectNode();
+                o.put("label", r.label());
+                o.put("type", r.type());
+                o.put("category", r.category());
+                putIntIfPresent(o, "baseTotal", r.baseTotal());
+                putIntIfPresent(o, "compareTotal", r.compareTotal());
+                putIntIfPresent(o, "deltaVsCompare", r.deltaVsCompare());
+                putIntIfPresent(o, "actualTotal", r.actualTotal());
+                putIntIfPresent(o, "deltaVsActual", r.deltaVsActual());
+                rows.add(o);
+            }
+            root.set("resultRows", rows);
+            return objectMapper.writeValueAsString(root);
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to build analysis payload: " + e.getMessage(), e);
+        }
+    }
+
+    private static void putIntIfPresent(ObjectNode o, String key, Integer v) {
+        if (v != null) {
+            o.put(key, v);
+        }
+    }
+
+    private JsonNode fetchAnalysisJsonOpenAi(String userPayload) {
+        if (openaiApiKey == null || openaiApiKey.isBlank()) {
+            throw new IllegalStateException("OPENAI_API_KEY / planora.ai.openai.api-key is not configured");
+        }
+        ObjectNode body = objectMapper.createObjectNode();
+        body.put("model", "gpt-4o-mini");
+        ArrayNode messages = body.putArray("messages");
+        messages.addObject().put("role", "system").put("content", ANALYSIS_SYSTEM_PROMPT);
+        messages.addObject().put("role", "user").put("content", userPayload);
+        body.putObject("response_format").put("type", "json_object");
+        body.put("temperature", 0.2);
+        String raw;
+        try {
+            raw = restClient.post()
+                    .uri("https://api.openai.com/v1/chat/completions")
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + openaiApiKey)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(objectMapper.writeValueAsString(body))
+                    .retrieve()
+                    .body(String.class);
+        } catch (Exception e) {
+            throw new IllegalStateException("OpenAI analysis request failed: " + e.getMessage(), e);
+        }
+        try {
+            JsonNode tree = objectMapper.readTree(raw);
+            String content = tree.path("choices").path(0).path("message").path("content").asText();
+            return objectMapper.readTree(content);
+        } catch (Exception e) {
+            throw new IllegalStateException("OpenAI analysis response parse failed: " + e.getMessage(), e);
+        }
+    }
+
+    private JsonNode fetchAnalysisJsonGemini(String userPayload) {
+        if (geminiApiKey == null || geminiApiKey.isBlank()) {
+            throw new IllegalStateException("GEMINI_API_KEY / planora.ai.gemini.api-key is not configured");
+        }
+        String fullPrompt = ANALYSIS_SYSTEM_PROMPT + "\n\nData (JSON):\n" + userPayload;
+        ObjectNode body = objectMapper.createObjectNode();
+        body.putArray("contents").addObject().putArray("parts").addObject().put("text", fullPrompt);
+        body.putObject("generationConfig")
+                .put("responseMimeType", "application/json")
+                .put("temperature", 0.2);
+        String url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key="
+                + geminiApiKey;
+        String raw;
+        try {
+            raw = restClient.post()
+                    .uri(url)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(objectMapper.writeValueAsString(body))
+                    .retrieve()
+                    .body(String.class);
+        } catch (Exception e) {
+            throw new IllegalStateException("Gemini analysis request failed: " + e.getMessage(), e);
+        }
+        try {
+            JsonNode root = objectMapper.readTree(raw);
+            String text = root.path("candidates").path(0).path("content").path("parts").path(0).path("text").asText();
+            return objectMapper.readTree(text);
+        } catch (Exception e) {
+            throw new IllegalStateException("Gemini analysis response parse failed: " + e.getMessage(), e);
+        }
+    }
+
+    private static AskPlanAnalyzeResponse toAnalyzeResponse(JsonNode root) {
+        if (root == null || !root.isObject()) {
+            return new AskPlanAnalyzeResponse(List.of("Analysis could not be parsed."));
+        }
+        JsonNode arr = root.get("points");
+        if (arr == null || !arr.isArray()) {
+            return new AskPlanAnalyzeResponse(List.of("Analysis could not be parsed."));
+        }
+        List<String> out = new ArrayList<>();
+        for (JsonNode p : arr) {
+            if (p == null || p.isNull()) {
+                continue;
+            }
+            String t = p.asText("").trim();
+            if (!t.isEmpty()) {
+                out.add(t);
+            }
+            if (out.size() >= 5) {
+                break;
+            }
+        }
+        if (out.isEmpty()) {
+            return new AskPlanAnalyzeResponse(List.of("No analysis points returned."));
+        }
+        return new AskPlanAnalyzeResponse(List.copyOf(out));
     }
 
     static ParsedAskIntent toIntent(JsonNode n) {

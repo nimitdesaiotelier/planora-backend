@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import lombok.RequiredArgsConstructor;
 import org.apache.poi.ss.usermodel.BorderStyle;
@@ -47,6 +48,30 @@ public class AskPlanExcelExportService {
     private static final String[] MONTHS = {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
     };
+
+    /** Matches Ask Plan UI: Department, COA code, COA name, Account type, Category — then months / totals. */
+    private static final int DESCRIPTOR_COL_COUNT = 5;
+
+    private static String excelDepartment(AskPlanRowDto r) {
+        String d = r.department();
+        return d != null ? d : "";
+    }
+
+    private static String excelCoaCode(AskPlanRowDto r) {
+        String c = r.coaCode();
+        if (c != null && !c.isBlank()) {
+            return c;
+        }
+        return r.lineKey() != null ? r.lineKey() : "";
+    }
+
+    private static String excelCoaName(AskPlanRowDto r) {
+        String n = r.coaName();
+        if (n != null && !n.isBlank()) {
+            return n;
+        }
+        return r.label() != null ? r.label() : "";
+    }
 
     @Transactional(readOnly = true)
     public AskPlanExcelExportResult export(AskPlanExcelExportRequest request) throws IOException {
@@ -108,16 +133,22 @@ public class AskPlanExcelExportService {
             Row totalRow = sheet.createRow(totalRowIndex);
             writeTotalRow(totalRow, flags, totals, tableStyles);
 
-            for (int c = 0; c < headerCols; c++) {
-                sheet.autoSizeColumn(c);
-            }
-            if (useBaseActualMonthLayout(flags)) {
-                sheet.setColumnWidth(0, 5 * 256);
-            }
+            autoSizeColumnsWithLimits(sheet, headerCols);
 
             if (includeChart && !rows.isEmpty()) {
                 AskPlanExcelChart.addMonthlyLineChartPerLineItem(
                         sheet, useBaseActualMonthLayout(flags), dataStart, rows, totalRowIndex);
+            }
+
+            List<String> analysisPoints = request.analysisPoints();
+            if (analysisPoints != null && !analysisPoints.isEmpty()) {
+                int analysisStartRow;
+                if (includeChart && !rows.isEmpty()) {
+                    analysisStartRow = AskPlanExcelChart.firstRowBelowMonthlyChart(totalRowIndex);
+                } else {
+                    analysisStartRow = totalRowIndex + 2;
+                }
+                writeAnalysisSection(sheet, wb, analysisStartRow, analysisPoints, headerCols);
             }
 
             byte[] bytes = toBytes(wb);
@@ -304,16 +335,33 @@ public class AskPlanExcelExportService {
         }
     }
 
-    /** Actuals without plan-compare: two header rows (month + Base/Actual), leading blank column, merges. */
+    /** Auto-size each column, then clamp width so headers/long text don’t explode layout. */
+    private static void autoSizeColumnsWithLimits(XSSFSheet sheet, int columnCount) {
+        final int minChars = 8;
+        final int maxChars = 48;
+        for (int c = 0; c < columnCount; c++) {
+            sheet.autoSizeColumn(c);
+            int w = sheet.getColumnWidth(c);
+            int minW = minChars * 256;
+            int maxW = maxChars * 256;
+            if (w < minW) {
+                sheet.setColumnWidth(c, minW);
+            } else if (w > maxW) {
+                sheet.setColumnWidth(c, maxW);
+            }
+        }
+    }
+
+    /** Actuals without plan-compare: two header rows (month + Base/Actual), merges. */
     private static boolean useBaseActualMonthLayout(ViewFlags flags) {
         return flags.showActuals && !flags.showCompare;
     }
 
     private static int countHeaderColumns(ViewFlags flags) {
         if (useBaseActualMonthLayout(flags)) {
-            return 1 + 3 + MONTHS.length * 2 + 2;
+            return DESCRIPTOR_COL_COUNT + MONTHS.length * 2 + 2;
         }
-        int c = 3 + MONTHS.length + 1;
+        int c = DESCRIPTOR_COL_COUNT + MONTHS.length + 1;
         if (flags.showCompare) {
             c += MONTHS.length + 2;
         }
@@ -324,34 +372,35 @@ public class AskPlanExcelExportService {
     }
 
     /**
-     * Base | Actual: column 0 blank (merged across two header rows); Label/Type/Category merge vertically;
-     * each month merges {@code Jan}…{@code Dec} over Base+Actual; Total merges over Total Base + Total Actual.
+     * Base | Actual: descriptor columns merge vertically; each month merges {@code Jan}…{@code Dec} over Base+Actual;
+     * Total merges over Total Base + Total Actual.
      */
     private static void buildBaseActualTwoRowHeader(XSSFSheet sheet, int topRow, CellStyle tableHeaderStyle) {
         Row r0 = sheet.createRow(topRow);
         Row r1 = sheet.createRow(topRow + 1);
 
-        Cell cBlank = r0.createCell(0);
-        cBlank.setBlank();
-        cBlank.setCellStyle(tableHeaderStyle);
-        CellRangeAddress rBlank = new CellRangeAddress(topRow, topRow + 1, 0, 0);
-        sheet.addMergedRegion(rBlank);
-        applyMergedRegionThinBorder(sheet, rBlank);
-
-        setHeaderCell(r0, 1, "Label", tableHeaderStyle);
-        CellRangeAddress rLabel = new CellRangeAddress(topRow, topRow + 1, 1, 1);
-        sheet.addMergedRegion(rLabel);
-        applyMergedRegionThinBorder(sheet, rLabel);
-        setHeaderCell(r0, 2, "Type", tableHeaderStyle);
-        CellRangeAddress rType = new CellRangeAddress(topRow, topRow + 1, 2, 2);
-        sheet.addMergedRegion(rType);
-        applyMergedRegionThinBorder(sheet, rType);
-        setHeaderCell(r0, 3, "Category", tableHeaderStyle);
-        CellRangeAddress rCat = new CellRangeAddress(topRow, topRow + 1, 3, 3);
+        setHeaderCell(r0, 0, "Department", tableHeaderStyle);
+        CellRangeAddress rDep = new CellRangeAddress(topRow, topRow + 1, 0, 0);
+        sheet.addMergedRegion(rDep);
+        applyMergedRegionThinBorder(sheet, rDep);
+        setHeaderCell(r0, 1, "COA code", tableHeaderStyle);
+        CellRangeAddress rCoaCode = new CellRangeAddress(topRow, topRow + 1, 1, 1);
+        sheet.addMergedRegion(rCoaCode);
+        applyMergedRegionThinBorder(sheet, rCoaCode);
+        setHeaderCell(r0, 2, "COA name", tableHeaderStyle);
+        CellRangeAddress rCoaName = new CellRangeAddress(topRow, topRow + 1, 2, 2);
+        sheet.addMergedRegion(rCoaName);
+        applyMergedRegionThinBorder(sheet, rCoaName);
+        setHeaderCell(r0, 3, "Account type", tableHeaderStyle);
+        CellRangeAddress rAcc = new CellRangeAddress(topRow, topRow + 1, 3, 3);
+        sheet.addMergedRegion(rAcc);
+        applyMergedRegionThinBorder(sheet, rAcc);
+        setHeaderCell(r0, 4, "Category", tableHeaderStyle);
+        CellRangeAddress rCat = new CellRangeAddress(topRow, topRow + 1, 4, 4);
         sheet.addMergedRegion(rCat);
         applyMergedRegionThinBorder(sheet, rCat);
 
-        int col = 4;
+        int col = 5;
         for (String m : MONTHS) {
             setHeaderCell(r0, col, m, tableHeaderStyle);
             CellRangeAddress mo = new CellRangeAddress(topRow, topRow, col, col + 1);
@@ -371,8 +420,10 @@ public class AskPlanExcelExportService {
 
     private static void buildHeader(Row h, ViewFlags flags, CellStyle tableHeaderStyle) {
         int c = 0;
-        setHeaderCell(h, c++, "Label", tableHeaderStyle);
-        setHeaderCell(h, c++, "Type", tableHeaderStyle);
+        setHeaderCell(h, c++, "Department", tableHeaderStyle);
+        setHeaderCell(h, c++, "COA code", tableHeaderStyle);
+        setHeaderCell(h, c++, "COA name", tableHeaderStyle);
+        setHeaderCell(h, c++, "Account type", tableHeaderStyle);
         setHeaderCell(h, c++, "Category", tableHeaderStyle);
         for (String m : MONTHS) {
             setHeaderCell(h, c++, m, tableHeaderStyle);
@@ -403,10 +454,9 @@ public class AskPlanExcelExportService {
     private static void writeDataRow(Row row, AskPlanRowDto r, ViewFlags flags, Totals totals, TableStyles st) {
         int c = 0;
         if (useBaseActualMonthLayout(flags)) {
-            Cell lead = row.createCell(c++);
-            lead.setBlank();
-            lead.setCellStyle(st.dataText());
-            setStringCell(row.createCell(c++), r.label(), st.dataLabel());
+            setStringCell(row.createCell(c++), excelDepartment(r), st.dataText());
+            setStringCell(row.createCell(c++), excelCoaCode(r), st.dataText());
+            setStringCell(row.createCell(c++), excelCoaName(r), st.dataText());
             setStringCell(row.createCell(c++), r.type(), st.dataText());
             setStringCell(row.createCell(c++), r.category(), st.dataText());
             for (String m : MONTHS) {
@@ -424,7 +474,9 @@ public class AskPlanExcelExportService {
             return;
         }
 
-        setStringCell(row.createCell(c++), r.label(), st.dataLabel());
+        setStringCell(row.createCell(c++), excelDepartment(r), st.dataText());
+        setStringCell(row.createCell(c++), excelCoaCode(r), st.dataText());
+        setStringCell(row.createCell(c++), excelCoaName(r), st.dataText());
         setStringCell(row.createCell(c++), r.type(), st.dataText());
         setStringCell(row.createCell(c++), r.category(), st.dataText());
 
@@ -463,13 +515,10 @@ public class AskPlanExcelExportService {
     private static void writeTotalRow(Row row, ViewFlags flags, Totals totals, TableStyles st) {
         int c = 0;
         if (useBaseActualMonthLayout(flags)) {
-            Cell lead = row.createCell(c++);
-            lead.setBlank();
-            lead.setCellStyle(st.totalEmpty());
             Cell totalLabel = row.createCell(c++);
             totalLabel.setCellValue("Total");
             totalLabel.setCellStyle(st.totalLabel());
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < DESCRIPTOR_COL_COUNT - 1; i++) {
                 Cell blank = row.createCell(c++);
                 blank.setBlank();
                 blank.setCellStyle(st.totalEmpty());
@@ -486,7 +535,7 @@ public class AskPlanExcelExportService {
         Cell first = row.createCell(c++);
         first.setCellValue("Total");
         first.setCellStyle(st.totalLabel());
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < DESCRIPTOR_COL_COUNT - 1; i++) {
             Cell blank = row.createCell(c++);
             blank.setBlank();
             blank.setCellStyle(st.totalEmpty());
@@ -660,6 +709,56 @@ public class AskPlanExcelExportService {
 
         long deltaActualSum() {
             return deltaActual;
+        }
+    }
+
+    private static void writeAnalysisSection(
+            XSSFSheet sheet,
+            XSSFWorkbook wb,
+            int startRow,
+            List<String> points,
+            int headerColCount) {
+        List<String> cleaned =
+                points.stream().filter(Objects::nonNull).map(String::trim).filter(s -> !s.isEmpty()).toList();
+        if (cleaned.isEmpty()) {
+            return;
+        }
+        int lastCol = Math.max(0, headerColCount - 1);
+
+        Font titleFont = wb.createFont();
+        titleFont.setBold(true);
+        titleFont.setFontHeightInPoints((short) 11);
+        CellStyle titleStyle = wb.createCellStyle();
+        titleStyle.setFont(titleFont);
+        titleStyle.setWrapText(true);
+        titleStyle.setVerticalAlignment(VerticalAlignment.TOP);
+        titleStyle.setAlignment(HorizontalAlignment.LEFT);
+
+        Font bodyFont = wb.createFont();
+        CellStyle bodyStyle = wb.createCellStyle();
+        bodyStyle.setFont(bodyFont);
+        bodyStyle.setWrapText(true);
+        bodyStyle.setVerticalAlignment(VerticalAlignment.TOP);
+        bodyStyle.setAlignment(HorizontalAlignment.LEFT);
+
+        int r = startRow;
+        Row titleRow = sheet.createRow(r++);
+        Cell titleCell = titleRow.createCell(0);
+        titleCell.setCellValue("Analysis");
+        titleCell.setCellStyle(titleStyle);
+        if (lastCol > 0) {
+            sheet.addMergedRegion(new CellRangeAddress(startRow, startRow, 0, lastCol));
+        }
+
+        for (String p : cleaned) {
+            int rowIdx = r++;
+            Row pr = sheet.createRow(rowIdx);
+            Cell c = pr.createCell(0);
+            c.setCellValue("• " + p);
+            c.setCellStyle(bodyStyle);
+            if (lastCol > 0) {
+                sheet.addMergedRegion(new CellRangeAddress(rowIdx, rowIdx, 0, lastCol));
+            }
         }
     }
 }

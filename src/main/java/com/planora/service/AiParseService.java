@@ -74,7 +74,10 @@ public class AiParseService {
 
             RULES:
 
-            The "Current year" is provided in the user message context. Use it as the base for all year calculations.
+            The "Plan year" and "Plan type" are provided in the user message context.
+            - "Plan year" is the fiscal year of the plan being edited.
+            - "Plan type" is the type of the plan being edited (e.g. BUDGET, FORECAST, WHAT_IF).
+            Use "Plan year" as the base for all relative year calculations (last year, previous year, N years ago, etc.).
 
             action:
             - "increase" for growth/raise/add
@@ -93,6 +96,15 @@ public class AiParseService {
             - "what_if"      — copy from a WHAT-IF / scenario plan. Use when user says "what if", "what-if", "scenario".
             - "current_plan" — copy from a DIFFERENT ROW within the same current plan. Use when user says "current plan", "this plan", "same plan", or names a specific row/account (e.g. "Banquet Revenue") without mentioning actuals/budget/forecast/what_if.
 
+            IMPORTANT — resolving type when user says generic terms like "plan", "data", or "last year" WITHOUT specifying a data type:
+            - If user says "copy from last year plan" or just "copy from last year" without specifying actuals/budget/forecast/what_if:
+              → Use the "Plan type" from context as the copy type.
+              → e.g. if Plan type = BUDGET → type = "budget"; if Plan type = WHAT_IF → type = "what_if"; if Plan type = FORECAST → type = "forecast".
+            - User-specified data type ALWAYS overrides the plan context:
+              → "copy from last year budget" → type = "budget" regardless of Plan type.
+              → "copy from last year what-if" → type = "what_if" regardless of Plan type.
+              → "copy from last year actuals" → type = "actuals" regardless of Plan type.
+
             source_row_label (for copy with type="current_plan" only):
             - The human-readable label of the row to copy FROM within the same plan (e.g. "Banquet Revenue", "Room Revenue").
             - Set to null for all other copy types (actuals, budget, forecast, what_if).
@@ -100,11 +112,11 @@ public class AiParseService {
             source_year (for copy only):
             - REQUIRED for actuals/budget/forecast/what_if copy instructions (never leave null for those).
             - Must be a concrete 4-digit year (e.g. 2025, 2024, 2023).
-            - Derive from "Current year" provided in context:
-              "this year" / "current year" actuals     → source_year = Current year
-              "last year" / "previous year" actuals     → source_year = Current year − 1
-              "last to last year" / "year before last"  → source_year = Current year − 2
-              "N years ago"                             → source_year = Current year − N
+            - ALWAYS derive relative years from "Plan year" (NOT the current calendar year):
+              "this year" / "current year"              → source_year = Plan year
+              "last year" / "previous year"              → source_year = Plan year − 1
+              "last to last year" / "year before last"   → source_year = Plan year − 2
+              "N years ago"                              → source_year = Plan year − N
             - If user gives an explicit 4-digit year (e.g. "2023 actuals"), use that year directly as source_year.
             - For type="current_plan" set source_year = null (no year needed; it's the same plan).
             - For non-copy actions, set source_year = null.
@@ -137,7 +149,7 @@ public class AiParseService {
             - If the user gives MULTIPLE independent changes (e.g. "Jan +2000 and Feb +10%"), use MULTIPLE objects in "instructions" — one per change.
             - Do NOT merge different periods into one step.
 
-            EXAMPLES (assuming Current year = 2026):
+            EXAMPLES (assuming Plan year = 2025):
 
             "Increase by 10% for Q2":
             {"summary":"Increase Q2 by 10%.","instructions":[
@@ -155,29 +167,49 @@ public class AiParseService {
               {"action":"increase","value":10,"type":"percentage","source_year":null,"property_hint":null,"period":"Feb"}
             ]}
 
-            "Copy from last year actuals" (Current year = 2026 → source_year = 2025):
+            "Copy from last year actuals" (Plan year = 2025 → source_year = 2024):
             {"summary":"Copy last year actuals.","instructions":[
-              {"action":"copy","value":null,"type":"actuals","source_year":2025,"property_hint":null,"period":"full_year"}
+              {"action":"copy","value":null,"type":"actuals","source_year":2024,"property_hint":null,"period":"full_year"}
             ]}
 
-            "Take data from last to last year budget" (Current year = 2026 → source_year = 2024):
+            "Take data from last to last year budget" (Plan year = 2025 → source_year = 2023):
             {"summary":"Copy budget from two years ago.","instructions":[
-              {"action":"copy","value":null,"type":"budget","source_year":2024,"property_hint":null,"period":"full_year"}
-            ]}
-
-            "Copy Jan data from this year Burlington forecast" (Current year = 2026 → source_year = 2026):
-            {"summary":"Copy Jan from Burlington forecast for this year.","instructions":[
-              {"action":"copy","value":null,"type":"forecast","source_year":2026,"property_hint":"Burlington","period":"Jan"}
-            ]}
-
-            "Copy 3 years ago budget" (Current year = 2026 → source_year = 2023):
-            {"summary":"Copy budget from 3 years ago.","instructions":[
               {"action":"copy","value":null,"type":"budget","source_year":2023,"property_hint":null,"period":"full_year"}
+            ]}
+
+            "Copy Jan data from this year Burlington forecast" (Plan year = 2025 → source_year = 2025):
+            {"summary":"Copy Jan from Burlington forecast for this year.","instructions":[
+              {"action":"copy","value":null,"type":"forecast","source_year":2025,"property_hint":"Burlington","period":"Jan"}
+            ]}
+
+            "Copy 3 years ago budget" (Plan year = 2025 → source_year = 2022):
+            {"summary":"Copy budget from 3 years ago.","instructions":[
+              {"action":"copy","value":null,"type":"budget","source_year":2022,"property_hint":null,"period":"full_year"}
             ]}
 
             "Copy from 2022 actuals":
             {"summary":"Copy 2022 actuals.","instructions":[
               {"action":"copy","value":null,"type":"actuals","source_year":2022,"property_hint":null,"period":"full_year"}
+            ]}
+
+            "Copy from last year plan" (Plan year = 2025, Plan type = BUDGET → type = budget, source_year = 2024):
+            {"summary":"Copy last year budget.","instructions":[
+              {"action":"copy","value":null,"type":"budget","source_year":2024,"property_hint":null,"period":"full_year"}
+            ]}
+
+            "Copy from last year" (Plan year = 2026, Plan type = WHAT_IF → type = what_if, source_year = 2025):
+            {"summary":"Copy last year what-if data.","instructions":[
+              {"action":"copy","value":null,"type":"what_if","source_year":2025,"property_hint":null,"period":"full_year"}
+            ]}
+
+            "Copy from last year" (Plan year = 2025, Plan type = FORECAST → type = forecast, source_year = 2024):
+            {"summary":"Copy last year forecast.","instructions":[
+              {"action":"copy","value":null,"type":"forecast","source_year":2024,"property_hint":null,"period":"full_year"}
+            ]}
+
+            "Copy from last year budget" (Plan year = 2025, Plan type = WHAT_IF → user override: type = budget, source_year = 2024):
+            {"summary":"Copy last year budget.","instructions":[
+              {"action":"copy","value":null,"type":"budget","source_year":2024,"property_hint":null,"period":"full_year"}
             ]}
 
             "Increase all weekends by 1000":
@@ -246,7 +278,7 @@ public class AiParseService {
         log.debug("AI parsed steps: {}", steps);
 
         if (steps.isEmpty()) {
-            throw new IllegalStateException("AI returned no instructions — try rephrasing.");
+            throw new IllegalStateException("Could not interpret your request — please refine the prompt");
         }
 
         Set<String> warnings = new LinkedHashSet<>();
@@ -425,9 +457,10 @@ public class AiParseService {
         if (openaiApiKey == null || openaiApiKey.isBlank()) {
             throw new IllegalStateException("OPENAI_API_KEY / planora.ai.openai.api-key is not configured");
         }
-        int currentYear = Year.now().getValue();
-        String userContent = "Current year: %d\nRow: \"%s\"\nInstruction: \"%s\"\n\nParse into the JSON object."
-                .formatted(currentYear, req.rowLabel(), req.instruction());
+        int planYear = req.fiscalYear() != null ? req.fiscalYear() : Year.now().getValue();
+        String planType = req.planType() != null && !req.planType().isBlank() ? req.planType() : "BUDGET";
+        String userContent = "Plan year: %d\nPlan type: %s\nRow: \"%s\"\nInstruction: \"%s\"\n\nParse into the JSON object."
+                .formatted(planYear, planType, req.rowLabel(), req.instruction());
 
         ObjectNode body = objectMapper.createObjectNode();
         body.put("model", "gpt-4o-mini");
@@ -463,9 +496,10 @@ public class AiParseService {
         if (geminiApiKey == null || geminiApiKey.isBlank()) {
             throw new IllegalStateException("GEMINI_API_KEY / planora.ai.gemini.api-key is not configured");
         }
-        int currentYear = Year.now().getValue();
-        String fullPrompt = SYSTEM_PROMPT + "\n\nCurrent year: %d\nRow: \"%s\"\nInstruction: \"%s\"\n\nParse into the JSON only."
-                .formatted(currentYear, req.rowLabel(), req.instruction());
+        int planYear = req.fiscalYear() != null ? req.fiscalYear() : Year.now().getValue();
+        String planType = req.planType() != null && !req.planType().isBlank() ? req.planType() : "BUDGET";
+        String fullPrompt = SYSTEM_PROMPT + "\n\nPlan year: %d\nPlan type: %s\nRow: \"%s\"\nInstruction: \"%s\"\n\nParse into the JSON only."
+                .formatted(planYear, planType, req.rowLabel(), req.instruction());
 
         ObjectNode body = objectMapper.createObjectNode();
         body.putArray("contents")
