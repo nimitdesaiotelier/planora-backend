@@ -149,6 +149,10 @@ public class AiParseService {
             - If the user gives MULTIPLE independent changes (e.g. "Jan +2000 and Feb +10%"), use MULTIPLE objects in "instructions" — one per change.
             - Do NOT merge different periods into one step.
 
+            INVALID OR NON-BUDGET INPUT:
+            - If the instruction is meaningless (random letters, gibberish), unrelated to budgeting, or does not describe any change, return {"summary":"","instructions":[]}.
+            - For type "current_plan" copy: NEVER invent or guess source_row_label from the Row context or other lines in the plan. Only set source_row_label when the user explicitly names or clearly refers to that row in the instruction. Otherwise use {"summary":"","instructions":[]}.
+
             EXAMPLES (assuming Plan year = 2025):
 
             "Increase by 10% for Q2":
@@ -237,6 +241,9 @@ public class AiParseService {
               {"action":"copy","value":null,"type":"current_plan","source_year":null,"source_row_label":"Room Revenue","property_hint":null,"period":"Jan"}
             ]}
 
+            "ABC" (meaningless — no budget instruction):
+            {"summary":"","instructions":[]}
+
             Respond with ONLY valid JSON, no markdown.""";
     // @formatter:on
 
@@ -278,8 +285,12 @@ public class AiParseService {
         log.debug("AI parsed steps: {}", steps);
 
         if (steps.isEmpty()) {
-            throw new IllegalStateException("Could not interpret your request — please refine the prompt");
+            throw new IllegalStateException(
+                    "That is not a valid action instruction. Please try again with a clear action "
+                            + "(for example: increase, decrease, set an amount, or copy from a source).");
         }
+
+        validateCurrentPlanCopyGroundedInInstruction(req.instruction(), steps);
 
         Set<String> warnings = new LinkedHashSet<>();
         Integer fy = req.fiscalYear();
@@ -341,6 +352,68 @@ public class AiParseService {
         List<String> warningList = warnings.isEmpty() ? null : List.copyOf(warnings);
 
         return new ParsedInstructionDto(mergedSummary, steps, warningList, working, newDailyDetails);
+    }
+
+    /**
+     * Rejects hallucinated cross-row copies: for {@code copy} + {@code current_plan}, the user text must mention
+     * the source row label (so inputs like "ABC" cannot produce a copy from "ADR" unless the user wrote it).
+     */
+    private static void validateCurrentPlanCopyGroundedInInstruction(
+            String instruction, List<InstructionStepDto> steps) {
+        if (instruction == null || instruction.isBlank()) {
+            return;
+        }
+        String normInst = normalizeForInstructionMatch(instruction);
+        for (InstructionStepDto step : steps) {
+            if (step == null || !"copy".equalsIgnoreCase(step.action())) {
+                continue;
+            }
+            String t = step.type();
+            if (t == null || !"current_plan".equalsIgnoreCase(t.trim())) {
+                continue;
+            }
+            String label = step.sourceRowLabel();
+            if (label == null || label.isBlank()) {
+                continue;
+            }
+            if (!instructionMentionsSourceRowLabel(normInst, label)) {
+                throw new IllegalStateException(
+                        "That is not a valid plan instruction. Please try again with a clear action "
+                                + "(for example: increase, decrease, set an amount, or copy from a source).");
+            }
+        }
+    }
+
+    /** Lowercase, collapse whitespace, strip punctuation to spaces (same idea as {@link SourceDataResolverService}). */
+    private static String normalizeForInstructionMatch(String text) {
+        if (text == null || text.isBlank()) {
+            return "";
+        }
+        return text.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", " ").trim();
+    }
+
+    /**
+     * True if the full normalized label appears in the instruction, or every word of length ≥2 from the label appears.
+     */
+    private static boolean instructionMentionsSourceRowLabel(String normalizedInstruction, String sourceRowLabel) {
+        String normLabel = normalizeForInstructionMatch(sourceRowLabel);
+        if (normLabel.isEmpty()) {
+            return true;
+        }
+        if (normalizedInstruction.contains(normLabel)) {
+            return true;
+        }
+        String[] words = normLabel.split(" ");
+        boolean anySignificant = false;
+        for (String w : words) {
+            if (w.length() >= 2) {
+                anySignificant = true;
+                if (!normalizedInstruction.contains(w)) {
+                    return false;
+                }
+            }
+        }
+        return anySignificant;
     }
 
     // ─── Source data resolution ──────────────────────────────────────────
@@ -432,7 +505,7 @@ public class AiParseService {
                 optionalInt(n, "day_from"),
                 optionalInt(n, "day_to"),
                 textOrNull(n, "day_filter"),
-                textOrNull(n, "source_row_label"));
+                firstNonBlank(textOrNull(n, "source_row_label"), textOrNull(n, "sourceRowLabel")));
     }
 
     private static Integer optionalInt(JsonNode n, String field) {
@@ -440,6 +513,16 @@ public class AiParseService {
             return null;
         }
         return n.get(field).asInt();
+    }
+
+    private static String firstNonBlank(String a, String b) {
+        if (a != null && !a.isBlank()) {
+            return a;
+        }
+        if (b != null && !b.isBlank()) {
+            return b;
+        }
+        return a;
     }
 
     // ─── LLM provider calls ─────────────────────────────────────────────
