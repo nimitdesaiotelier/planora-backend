@@ -37,7 +37,10 @@ import org.springframework.transaction.annotation.Transactional;
  *
  * <p>Year is derived with deterministic precedence:
  * LLM {@code sourceYear} → explicit 4-digit year from raw instruction → inferred from
- * instruction phrases (e.g. "last year" = current calendar year − 1) → current calendar year.
+ * instruction phrases (e.g. "last year" = plan fiscal year − 1) → plan fiscal year → current calendar year.
+ *
+ * <p>Copy type is derived with deterministic precedence:
+ * LLM {@code type} (user-specified) → current plan's own {@link PlanType} (fallback).
  */
 @Slf4j
 @Service
@@ -58,26 +61,30 @@ public class SourceDataResolverService {
         return m.find() ? Integer.parseInt(m.group(1)) : null;
     }
 
-    private static Integer inferYearFromInstruction(String instruction) {
+    /**
+     * Resolves relative year phrases against the plan's fiscal year (not the current calendar year).
+     * Falls back to {@code Year.now()} only when {@code planFiscalYear} is null.
+     */
+    private static Integer inferYearFromInstruction(String instruction, Integer planFiscalYear) {
         if (instruction == null || instruction.isBlank()) {
             return null;
         }
         String t = instruction.toLowerCase(Locale.ROOT);
-        int now = Year.now().getValue();
+        int baseYear = planFiscalYear != null ? planFiscalYear : Year.now().getValue();
 
         if (t.contains("year before last") || t.contains("last to last year")) {
-            return now - 2;
+            return baseYear - 2;
         }
         if (t.contains("last year") || t.contains("previous year") || t.contains("prior year")) {
-            return now - 1;
+            return baseYear - 1;
         }
         if (t.contains("this year") || t.contains("current year")) {
-            return now;
+            return baseYear;
         }
 
         Matcher nYearsAgo = Pattern.compile("\\b(\\d+)\\s+years?\\s+ago\\b").matcher(t);
         if (nYearsAgo.find()) {
-            return now - Integer.parseInt(nYearsAgo.group(1));
+            return baseYear - Integer.parseInt(nYearsAgo.group(1));
         }
         return null;
     }
@@ -122,10 +129,17 @@ public class SourceDataResolverService {
             return resolveCurrentPlanRow(currentPlanId, step.sourceRowLabel(), lineKey);
         }
 
+        // ── If LLM didn't specify a type, fall back to the current plan's own type ──
+        if (sourceType == null) {
+            sourceType = planTypeToSourceType(currentPlan.getPlanType());
+            log.debug("LLM returned null type — falling back to current plan type: {}", sourceType);
+        }
+
         // ── external source: actuals / budget / forecast / what_if ─────────
+        Integer planFiscalYear = currentPlan.getFiscalYear();
         Integer llmSourceYear = step.sourceYear();
         Integer explicitYear = explicitCopySourceYear(instruction);
-        Integer inferredYear = inferYearFromInstruction(instruction);
+        Integer inferredYear = inferYearFromInstruction(instruction, planFiscalYear);
         int targetYear =
                 llmSourceYear != null
                         ? llmSourceYear
@@ -133,7 +147,9 @@ public class SourceDataResolverService {
                                 ? explicitYear
                                 : inferredYear != null
                                         ? inferredYear
-                                        : Year.now().getValue();
+                                        : planFiscalYear != null
+                                                ? planFiscalYear
+                                                : Year.now().getValue();
         Property targetProperty = resolveProperty(step.propertyHint(), currentPlan.getProperty());
 
         log.debug(
@@ -259,9 +275,13 @@ public class SourceDataResolverService {
 
     // ─── Helpers ─────────────────────────────────────────────────────────
 
+    /**
+     * Normalizes the LLM-provided type string.
+     * Returns {@code null} when type is blank/null — callers must handle the fallback to plan context.
+     */
     private static String normalizeType(String type) {
         if (type == null || type.isBlank()) {
-            return "budget";
+            return null;
         }
         String t = type.toLowerCase(Locale.ROOT).trim();
         if ("ly_actual".equals(t) || "ly_actuals".equals(t)) {
@@ -274,6 +294,20 @@ public class SourceDataResolverService {
             return "budget";
         }
         return t;
+    }
+
+    /**
+     * Maps the current plan's {@link PlanType} enum to the copy source-type string.
+     */
+    private static String planTypeToSourceType(PlanType planType) {
+        if (planType == null) {
+            return "budget";
+        }
+        return switch (planType) {
+            case BUDGET -> "budget";
+            case FORECAST -> "forecast";
+            case WHAT_IF -> "what_if";
+        };
     }
 
     private static String normalize(String text) {
