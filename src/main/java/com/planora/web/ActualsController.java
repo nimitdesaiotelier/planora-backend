@@ -30,6 +30,15 @@ public class ActualsController {
 
     private final ActualsService actualsService;
 
+    /** Distinct calendar years that have at least one actuals row for this property/org (newest first). */
+    @GetMapping("/years")
+    public List<Integer> listYears(
+            @RequestParam long propertyId,
+            @RequestParam(defaultValue = "1") long organizationId
+    ) {
+        return actualsService.listYearsWithData(propertyId, organizationId);
+    }
+
     @GetMapping
     public List<ActualsDetailDto> list(
             @RequestParam int year,

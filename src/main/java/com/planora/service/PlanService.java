@@ -6,6 +6,7 @@ import com.planora.domain.Plan;
 import com.planora.domain.PlanMonthlyDetails;
 import com.planora.domain.Property;
 import com.planora.enums.LineItemType;
+import com.planora.enums.PlanInitMode;
 import com.planora.enums.PlanStatus;
 import com.planora.repo.ActualsDetailRepository;
 import com.planora.repo.CoaRepository;
@@ -23,6 +24,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -91,7 +93,117 @@ public class PlanService {
             p.getLineItems().add(item);
         }
         Plan saved = planRepository.save(p);
+        applyInitialization(req, saved);
         return toSummary(saved);
+    }
+
+    /**
+     * Optionally copies Jan–Dec (and daily breakdown when present) from a source plan onto the new plan’s
+     * lines, matched by {@link PlanMonthlyDetails#getLineKey()}.
+     */
+    private void applyInitialization(CreatePlanRequest req, Plan newPlan) {
+        PlanInitMode mode = req.initMode() == null ? PlanInitMode.NONE : req.initMode();
+        if (mode == PlanInitMode.NONE) {
+            return;
+        }
+        if (mode == PlanInitMode.FROM_ACTUALS) {
+            copyLineValuesFromActuals(req, newPlan);
+            return;
+        }
+        Plan source = resolveSourcePlan(req, newPlan);
+        copyLineValuesFromPlan(newPlan.getId(), source.getId());
+    }
+
+    /**
+     * Fills month values (and regenerated daily split for the new plan fiscal year) from uploaded actuals,
+     * matched by COA / {@link PlanMonthlyDetails#getLineKey()}.
+     */
+    private void copyLineValuesFromActuals(CreatePlanRequest req, Plan newPlan) {
+        if (req.sourceYear() == null) {
+            throw new IllegalArgumentException("sourceYear is required when copying from actuals.");
+        }
+        long organizationId = req.organizationId() == null ? DEFAULT_ORG_ID : req.organizationId();
+        int sourceYear = req.sourceYear();
+        Long propertyId = req.propertyId();
+        List<ActualsDetails> rows = actualsDetailRepository
+                .findByYearAndProperty_IdAndOrganizationIdOrderByCoaCodeAsc(sourceYear, propertyId, organizationId);
+        if (rows.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "No actuals found for year " + sourceYear + ". Upload actuals for that year first.");
+        }
+        Map<String, ActualsDetails> byCoa = rows.stream()
+                .collect(Collectors.toMap(ActualsDetails::getCoaCode, a -> a, (a, b) -> a));
+        List<PlanMonthlyDetails> targets = lineItemRepository.findByPlan_Id(newPlan.getId());
+        int fiscalYear = newPlan.getFiscalYear();
+        for (PlanMonthlyDetails t : targets) {
+            ActualsDetails a = byCoa.get(t.getLineKey());
+            if (a != null) {
+                Map<String, Integer> months = actualsToMonthMap(a);
+                t.applyValuesMap(months);
+                t.applyDailyDetailsMap(
+                        dailyDetailsSplitService.buildDailyFromMonthly(months, fiscalYear, t.getType()));
+            }
+        }
+        lineItemRepository.saveAll(targets);
+    }
+
+    private Plan resolveSourcePlan(CreatePlanRequest req, Plan newPlan) {
+        Long propertyId = req.propertyId();
+        PlanInitMode mode = req.initMode() == null ? PlanInitMode.NONE : req.initMode();
+        return switch (mode) {
+            case NONE -> throw new IllegalStateException("resolveSourcePlan called with NONE");
+            case LAST_YEAR -> planRepository
+                    .findFirstByProperty_IdAndFiscalYearAndPlanTypeAndStatusOrderByIdAsc(
+                            propertyId, req.fiscalYear() - 1, req.planType(), PlanStatus.ACTIVE)
+                    .orElseThrow(() -> new IllegalArgumentException(
+                            "No active plan found for the previous year to copy from. Start empty or pick another source."));
+            case FROM_YEAR -> {
+                if (req.sourceYear() == null) {
+                    throw new IllegalArgumentException("sourceYear is required when initializing from a year.");
+                }
+                if (Objects.equals(req.sourceYear(), req.fiscalYear())) {
+                    throw new IllegalArgumentException("Source year must be different from the new plan's year.");
+                }
+                yield planRepository
+                        .findFirstByProperty_IdAndFiscalYearAndPlanTypeAndStatusOrderByIdAsc(
+                                propertyId, req.sourceYear(), req.planType(), PlanStatus.ACTIVE)
+                        .orElseThrow(() -> new IllegalArgumentException(
+                                "No active plan found for year " + req.sourceYear() + " to copy from."));
+            }
+            case FROM_PLAN -> {
+                if (req.sourcePlanId() == null) {
+                    throw new IllegalArgumentException("sourcePlanId is required when copying from a plan.");
+                }
+                Plan src = planRepository
+                        .findByIdAndStatus(req.sourcePlanId(), PlanStatus.ACTIVE)
+                        .orElseThrow(() -> new EntityNotFoundException("Source plan not found: " + req.sourcePlanId()));
+                if (!src.getProperty().getId().equals(propertyId)) {
+                    throw new IllegalArgumentException("Source plan must belong to the same property.");
+                }
+                if (src.getId().equals(newPlan.getId())) {
+                    throw new IllegalArgumentException("Cannot copy from the plan being created.");
+                }
+                yield src;
+            }
+            case FROM_ACTUALS -> throw new IllegalStateException("FROM_ACTUALS is handled in applyInitialization");
+        };
+    }
+
+    private void copyLineValuesFromPlan(Long targetPlanId, Long sourcePlanId) {
+        Map<String, PlanMonthlyDetails> sourceByKey = lineItemRepository.findByPlan_Id(sourcePlanId).stream()
+                .collect(Collectors.toMap(PlanMonthlyDetails::getLineKey, li -> li, (a, b) -> a));
+        List<PlanMonthlyDetails> targets = lineItemRepository.findByPlan_Id(targetPlanId);
+        for (PlanMonthlyDetails t : targets) {
+            PlanMonthlyDetails s = sourceByKey.get(t.getLineKey());
+            if (s != null) {
+                t.applyValuesMap(new LinkedHashMap<>(s.toValuesMap()));
+                Map<String, List<Integer>> dd = s.getDailyDetails();
+                if (dd != null && !dd.isEmpty()) {
+                    t.applyDailyDetailsMap(dd);
+                }
+            }
+        }
+        lineItemRepository.saveAll(targets);
     }
 
     @Transactional
