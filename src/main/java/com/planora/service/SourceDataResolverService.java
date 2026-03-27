@@ -12,11 +12,14 @@ import com.planora.repo.PlanRepository;
 import com.planora.repo.PropertyRepository;
 import com.planora.web.dto.InstructionStepDto;
 import java.math.BigDecimal;
+import java.time.Year;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -32,8 +35,9 @@ import org.springframework.transaction.annotation.Transactional;
  *   <li>{@code tbl_plan_monthly_details}   — when type = "budget", "forecast", or "what_if"</li>
  * </ul>
  *
- * <p>Year offset and property are derived from the step's {@code yearsAgo}
- * and {@code propertyHint} fields, with deterministic defaults.
+ * <p>Year is derived with deterministic precedence:
+ * LLM {@code sourceYear} → explicit 4-digit year from raw instruction → inferred from
+ * instruction phrases (e.g. "last year" = current calendar year − 1) → current calendar year.
  */
 @Slf4j
 @Service
@@ -41,6 +45,42 @@ import org.springframework.transaction.annotation.Transactional;
 public class SourceDataResolverService {
 
     private static final long DEFAULT_ORG_ID = 1L;
+
+    /** Detects an explicit 4-digit year in copy phrasing, e.g. "Copy from 2026 actuals" → 2026. */
+    private static final Pattern EXPLICIT_COPY_FROM_YEAR =
+            Pattern.compile("(?i)copy\\s+from\\s+(?:the\\s+(?:year\\s+)?)?(20\\d{2})\\b");
+
+    private static Integer explicitCopySourceYear(String instruction) {
+        if (instruction == null || instruction.isBlank()) {
+            return null;
+        }
+        Matcher m = EXPLICIT_COPY_FROM_YEAR.matcher(instruction.trim());
+        return m.find() ? Integer.parseInt(m.group(1)) : null;
+    }
+
+    private static Integer inferYearFromInstruction(String instruction) {
+        if (instruction == null || instruction.isBlank()) {
+            return null;
+        }
+        String t = instruction.toLowerCase(Locale.ROOT);
+        int now = Year.now().getValue();
+
+        if (t.contains("year before last") || t.contains("last to last year")) {
+            return now - 2;
+        }
+        if (t.contains("last year") || t.contains("previous year") || t.contains("prior year")) {
+            return now - 1;
+        }
+        if (t.contains("this year") || t.contains("current year")) {
+            return now;
+        }
+
+        Matcher nYearsAgo = Pattern.compile("\\b(\\d+)\\s+years?\\s+ago\\b").matcher(t);
+        if (nYearsAgo.find()) {
+            return now - Integer.parseInt(nYearsAgo.group(1));
+        }
+        return null;
+    }
 
     private final PlanRepository planRepository;
     private final LineItemRepository lineItemRepository;
@@ -62,7 +102,7 @@ public class SourceDataResolverService {
     }
 
     @Transactional(readOnly = true)
-    public SourceLookupResult resolve(long currentPlanId, String lineKey, InstructionStepDto step) {
+    public SourceLookupResult resolve(long currentPlanId, String lineKey, InstructionStepDto step, String instruction) {
         if (!"copy".equalsIgnoreCase(step.action())) {
             return SourceLookupResult.success(Map.of());
         }
@@ -76,12 +116,34 @@ public class SourceDataResolverService {
         }
 
         String sourceType = normalizeType(step.type());
-        int yearsAgo = step.yearsAgo() != null ? step.yearsAgo() : 0;
-        int targetYear = currentPlan.getFiscalYear() - yearsAgo;
+
+        // ── current_plan: cross-row copy within the same plan ──────────────
+        if ("current_plan".equals(sourceType)) {
+            return resolveCurrentPlanRow(currentPlanId, step.sourceRowLabel(), lineKey);
+        }
+
+        // ── external source: actuals / budget / forecast / what_if ─────────
+        Integer llmSourceYear = step.sourceYear();
+        Integer explicitYear = explicitCopySourceYear(instruction);
+        Integer inferredYear = inferYearFromInstruction(instruction);
+        int targetYear =
+                llmSourceYear != null
+                        ? llmSourceYear
+                        : explicitYear != null
+                                ? explicitYear
+                                : inferredYear != null
+                                        ? inferredYear
+                                        : Year.now().getValue();
         Property targetProperty = resolveProperty(step.propertyHint(), currentPlan.getProperty());
 
-        log.debug("Resolving copy: type={}, yearsAgo={}, targetYear={}, property={}",
-                sourceType, yearsAgo, targetYear, targetProperty.getName());
+        log.debug(
+                "Resolving copy: type={}, llmSourceYear={}, explicitYearFromInstruction={}, inferredYearFromInstruction={}, targetYear={}, property={}",
+                sourceType,
+                llmSourceYear,
+                explicitYear,
+                inferredYear,
+                targetYear,
+                targetProperty.getName());
 
         return switch (sourceType) {
             case "actuals" -> resolveActuals(targetYear, targetProperty, lineKey);
@@ -89,8 +151,54 @@ public class SourceDataResolverService {
             case "forecast" -> resolvePlanData(targetYear, targetProperty, PlanType.FORECAST, lineKey);
             case "what_if" -> resolvePlanData(targetYear, targetProperty, PlanType.WHAT_IF, lineKey);
             default -> SourceLookupResult.unavailable(
-                    "Unknown copy type: \"%s\". Use actuals, budget, forecast, or what_if.".formatted(step.type()));
+                    "Unknown copy type: \"%s\". Use actuals, budget, forecast, what_if, or current_plan.".formatted(step.type()));
         };
+    }
+
+    // ─── Current-plan cross-row copy ─────────────────────────────────────
+
+    /**
+     * Copies from a different row within the same plan.
+     * Matches by {@code sourceRowLabel} (fuzzy label match), falls back to the request's own {@code lineKey}.
+     */
+    private SourceLookupResult resolveCurrentPlanRow(long planId, String sourceRowLabel, String fallbackLineKey) {
+        String targetLineKey = fallbackLineKey;
+
+        if (sourceRowLabel != null && !sourceRowLabel.isBlank()) {
+            String hint = normalize(sourceRowLabel);
+            List<PlanMonthlyDetails> rows = lineItemRepository.findByPlan_Id(planId);
+
+            // exact label match first
+            Optional<PlanMonthlyDetails> exact = rows.stream()
+                    .filter(r -> normalize(r.getLabel()).equals(hint))
+                    .findFirst();
+            if (exact.isPresent()) {
+                targetLineKey = exact.get().getLineKey();
+            } else {
+                // partial / contains match
+                Optional<PlanMonthlyDetails> partial = rows.stream()
+                        .filter(r -> {
+                            String lab = normalize(r.getLabel());
+                            return !lab.isEmpty() && (lab.contains(hint) || hint.contains(lab));
+                        })
+                        .findFirst();
+                if (partial.isPresent()) {
+                    targetLineKey = partial.get().getLineKey();
+                } else {
+                    return SourceLookupResult.unavailable(
+                            "No row matching \"%s\" was found in the current plan.".formatted(sourceRowLabel));
+                }
+            }
+        }
+
+        log.debug("Resolving current_plan copy: sourceRowLabel={}, resolvedLineKey={}", sourceRowLabel, targetLineKey);
+
+        Optional<PlanMonthlyDetails> lineItem = lineItemRepository.findByPlan_IdAndLineKey(planId, targetLineKey);
+        if (lineItem.isEmpty()) {
+            return SourceLookupResult.unavailable(
+                    "Row \"%s\" was not found in the current plan.".formatted(targetLineKey));
+        }
+        return SourceLookupResult.success(lineItem.get().toValuesMap());
     }
 
     // ─── Actuals (tbl_actuals_details) ───────────────────────────────────

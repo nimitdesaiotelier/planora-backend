@@ -10,6 +10,7 @@ import com.planora.web.dto.InstructionStepDto;
 import com.planora.web.dto.ParseInstructionRequest;
 import com.planora.web.dto.ParsedInstructionDto;
 import java.time.Duration;
+import java.time.Year;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -59,17 +60,21 @@ public class AiParseService {
                   "action": "<increase|decrease|set|copy>",
                   "value": <number or null>,
                   "type": "<percentage|absolute|actuals|budget|forecast|what_if|null>",
-                  "years_ago": <integer or null>,
+                  "source_year": <4-digit integer or null>,
                   "property_hint": "<property/country/hotel name or null>",
                   "period": "<Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Q1|Q2|Q3|Q4|full_year|null>",
                   "day_from": <1-31 or null>,
                   "day_to": <1-31 or null>,
+                  "day_filter": "<weekends|weekdays|null>",
+                  "source_row_label": "<row label to copy from within the current plan, or null>",
                   "summary": "<optional per-step note>"
                 }
               ]
             }
 
             RULES:
+
+            The "Current year" is provided in the user message context. Use it as the base for all year calculations.
 
             action:
             - "increase" for growth/raise/add
@@ -82,17 +87,27 @@ public class AiParseService {
             - "absolute" for $ / fixed-number changes
 
             type (for copy):
-            - "actuals"  — copy from real actuals data (tbl_actuals_details). Use when user says "actuals", "actual data", "actual numbers", "real numbers".
-            - "budget"   — copy from a BUDGET plan (tbl_plan_monthly_details). Use when user says "budget", "budget data", "budget plan".
-            - "forecast" — copy from a FORECAST plan. Use when user says "forecast", "forecast data".
-            - "what_if"  — copy from a WHAT-IF / scenario plan. Use when user says "what if", "what-if", "scenario".
+            - "actuals"      — copy from real actuals data. Use when user says "actuals", "actual data", "actual numbers", "real numbers".
+            - "budget"       — copy from a BUDGET plan. Use when user says "budget", "budget data", "budget plan".
+            - "forecast"     — copy from a FORECAST plan. Use when user says "forecast", "forecast data".
+            - "what_if"      — copy from a WHAT-IF / scenario plan. Use when user says "what if", "what-if", "scenario".
+            - "current_plan" — copy from a DIFFERENT ROW within the same current plan. Use when user says "current plan", "this plan", "same plan", or names a specific row/account (e.g. "Banquet Revenue") without mentioning actuals/budget/forecast/what_if.
 
-            years_ago (for copy only):
-            - null or 0 means current fiscal year / this year
-            - 1 means last year / prior year / previous year
-            - 2 means year before last / last to last year / two years ago
-            - N means N fiscal years ago
-            - If user gives an explicit 4-digit year, still convert to years_ago relative to the plan's fiscal year
+            source_row_label (for copy with type="current_plan" only):
+            - The human-readable label of the row to copy FROM within the same plan (e.g. "Banquet Revenue", "Room Revenue").
+            - Set to null for all other copy types (actuals, budget, forecast, what_if).
+
+            source_year (for copy only):
+            - REQUIRED for actuals/budget/forecast/what_if copy instructions (never leave null for those).
+            - Must be a concrete 4-digit year (e.g. 2025, 2024, 2023).
+            - Derive from "Current year" provided in context:
+              "this year" / "current year" actuals     → source_year = Current year
+              "last year" / "previous year" actuals     → source_year = Current year − 1
+              "last to last year" / "year before last"  → source_year = Current year − 2
+              "N years ago"                             → source_year = Current year − N
+            - If user gives an explicit 4-digit year (e.g. "2023 actuals"), use that year directly as source_year.
+            - For type="current_plan" set source_year = null (no year needed; it's the same plan).
+            - For non-copy actions, set source_year = null.
 
             property_hint (for copy only):
             - The property/country/hotel name mentioned by user, or null if same property
@@ -110,46 +125,84 @@ public class AiParseService {
             - For a single day you may set only day_from; day_to defaults to the same day.
             - "copy" steps: omit day_from/day_to (whole months are copied); the engine replaces all days in affected months.
 
+            day_filter (optional, day-of-week filter):
+            - "weekends"  — apply only to Saturdays and Sundays
+            - "weekdays"  — apply only to Monday through Friday
+            - null         — apply to all days (default)
+            - Can be combined with period (e.g. "increase weekends in Q2 by 10%").
+            - day_filter CAN be combined with day_from/day_to: first iterate those calendar days, then skip days that do not match the filter.
+            - "first week weekdays of Jan" → period "Jan", day_from 1, day_to 7, day_filter "weekdays" (calendar days 1–7, weekdays only).
+
             MULTIPLE CHANGES:
             - If the user gives MULTIPLE independent changes (e.g. "Jan +2000 and Feb +10%"), use MULTIPLE objects in "instructions" — one per change.
             - Do NOT merge different periods into one step.
 
-            EXAMPLES:
+            EXAMPLES (assuming Current year = 2026):
 
             "Increase by 10% for Q2":
             {"summary":"Increase Q2 by 10%.","instructions":[
-              {"action":"increase","value":10,"type":"percentage","years_ago":null,"property_hint":null,"period":"Q2","day_from":null,"day_to":null}
+              {"action":"increase","value":10,"type":"percentage","source_year":null,"property_hint":null,"period":"Q2","day_from":null,"day_to":null}
             ]}
 
             "Increase 10% for April on the 1st only":
             {"summary":"Increase April 1 by 10%.","instructions":[
-              {"action":"increase","value":10,"type":"percentage","years_ago":null,"property_hint":null,"period":"Apr","day_from":1,"day_to":1}
+              {"action":"increase","value":10,"type":"percentage","source_year":null,"property_hint":null,"period":"Apr","day_from":1,"day_to":1}
             ]}
 
             "Increase Jan by $2000 and Feb by 10%":
             {"summary":"Raise Jan by $2,000 and Feb by 10%.","instructions":[
-              {"action":"increase","value":2000,"type":"absolute","years_ago":null,"property_hint":null,"period":"Jan"},
-              {"action":"increase","value":10,"type":"percentage","years_ago":null,"property_hint":null,"period":"Feb"}
+              {"action":"increase","value":2000,"type":"absolute","source_year":null,"property_hint":null,"period":"Jan"},
+              {"action":"increase","value":10,"type":"percentage","source_year":null,"property_hint":null,"period":"Feb"}
             ]}
 
-            "Set equal to last year actuals":
+            "Copy from last year actuals" (Current year = 2026 → source_year = 2025):
             {"summary":"Copy last year actuals.","instructions":[
-              {"action":"copy","value":null,"type":"actuals","years_ago":1,"property_hint":null,"period":"full_year"}
+              {"action":"copy","value":null,"type":"actuals","source_year":2025,"property_hint":null,"period":"full_year"}
             ]}
 
-            "Copy last to last year budget data":
-            {"summary":"Copy budget from two fiscal years ago.","instructions":[
-              {"action":"copy","value":null,"type":"budget","years_ago":2,"property_hint":null,"period":"full_year"}
+            "Take data from last to last year budget" (Current year = 2026 → source_year = 2024):
+            {"summary":"Copy budget from two years ago.","instructions":[
+              {"action":"copy","value":null,"type":"budget","source_year":2024,"property_hint":null,"period":"full_year"}
             ]}
 
-            "Copy Jan data from this year Burlington forecast":
+            "Copy Jan data from this year Burlington forecast" (Current year = 2026 → source_year = 2026):
             {"summary":"Copy Jan from Burlington forecast for this year.","instructions":[
-              {"action":"copy","value":null,"type":"forecast","years_ago":0,"property_hint":"Burlington","period":"Jan"}
+              {"action":"copy","value":null,"type":"forecast","source_year":2026,"property_hint":"Burlington","period":"Jan"}
             ]}
 
-            "Copy 3 years ago budget":
-            {"summary":"Copy budget from 3 fiscal years ago.","instructions":[
-              {"action":"copy","value":null,"type":"budget","years_ago":3,"property_hint":null,"period":"full_year"}
+            "Copy 3 years ago budget" (Current year = 2026 → source_year = 2023):
+            {"summary":"Copy budget from 3 years ago.","instructions":[
+              {"action":"copy","value":null,"type":"budget","source_year":2023,"property_hint":null,"period":"full_year"}
+            ]}
+
+            "Copy from 2022 actuals":
+            {"summary":"Copy 2022 actuals.","instructions":[
+              {"action":"copy","value":null,"type":"actuals","source_year":2022,"property_hint":null,"period":"full_year"}
+            ]}
+
+            "Increase all weekends by 1000":
+            {"summary":"Increase all weekend days by $1,000.","instructions":[
+              {"action":"increase","value":1000,"type":"absolute","source_year":null,"property_hint":null,"period":"full_year","day_from":null,"day_to":null,"day_filter":"weekends"}
+            ]}
+
+            "Decrease weekdays by 5% for Q3":
+            {"summary":"Decrease Q3 weekdays by 5%.","instructions":[
+              {"action":"decrease","value":5,"type":"percentage","source_year":null,"property_hint":null,"period":"Q3","day_from":null,"day_to":null,"day_filter":"weekdays"}
+            ]}
+
+            "Increase $1000 for first week weekdays of Jan" (calendar days 1–7, weekdays only):
+            {"summary":"Increase Jan weekdays in the first calendar week by $1,000.","instructions":[
+              {"action":"increase","value":1000,"type":"absolute","source_year":null,"property_hint":null,"period":"Jan","day_from":1,"day_to":7,"day_filter":"weekdays"}
+            ]}
+
+            "Copy data of Banquet Revenue from current plan":
+            {"summary":"Copy Banquet Revenue data from the current plan.","instructions":[
+              {"action":"copy","value":null,"type":"current_plan","source_year":null,"source_row_label":"Banquet Revenue","property_hint":null,"period":"full_year"}
+            ]}
+
+            "Copy Room Revenue from this plan for Jan":
+            {"summary":"Copy Room Revenue from current plan for January.","instructions":[
+              {"action":"copy","value":null,"type":"current_plan","source_year":null,"source_row_label":"Room Revenue","property_hint":null,"period":"Jan"}
             ]}
 
             Respond with ONLY valid JSON, no markdown.""";
@@ -266,7 +319,7 @@ public class AiParseService {
             return Map.of();
         }
         SourceDataResolverService.SourceLookupResult result =
-                sourceDataResolverService.resolve(req.planId(), req.lineKey(), step);
+                sourceDataResolverService.resolve(req.planId(), req.lineKey(), step, req.instruction());
         if (!result.available()) {
             if (result.warning() != null && !result.warning().isBlank()) {
                 warnings.add(result.warning());
@@ -334,20 +387,20 @@ public class AiParseService {
                 val = n.get("value").asText();
             }
         }
-        Integer yearsAgo = null;
-        if (n.has("years_ago") && !n.get("years_ago").isNull()) {
-            yearsAgo = n.get("years_ago").asInt(0);
-        }
+        Integer sourceYear = optionalInt(n, "source_year");
         return new InstructionStepDto(
                 textOrNull(n, "action"),
                 val,
                 textOrNull(n, "type"),
-                yearsAgo,
+                null,
+                sourceYear,
                 textOrNull(n, "property_hint"),
                 textOrNull(n, "period"),
                 textOrNull(n, "summary"),
                 optionalInt(n, "day_from"),
-                optionalInt(n, "day_to"));
+                optionalInt(n, "day_to"),
+                textOrNull(n, "day_filter"),
+                textOrNull(n, "source_row_label"));
     }
 
     private static Integer optionalInt(JsonNode n, String field) {
@@ -372,8 +425,9 @@ public class AiParseService {
         if (openaiApiKey == null || openaiApiKey.isBlank()) {
             throw new IllegalStateException("OPENAI_API_KEY / planora.ai.openai.api-key is not configured");
         }
-        String userContent = "Row: \"%s\"\nInstruction: \"%s\"\n\nParse into the JSON object."
-                .formatted(req.rowLabel(), req.instruction());
+        int currentYear = Year.now().getValue();
+        String userContent = "Current year: %d\nRow: \"%s\"\nInstruction: \"%s\"\n\nParse into the JSON object."
+                .formatted(currentYear, req.rowLabel(), req.instruction());
 
         ObjectNode body = objectMapper.createObjectNode();
         body.put("model", "gpt-4o-mini");
@@ -409,8 +463,9 @@ public class AiParseService {
         if (geminiApiKey == null || geminiApiKey.isBlank()) {
             throw new IllegalStateException("GEMINI_API_KEY / planora.ai.gemini.api-key is not configured");
         }
-        String fullPrompt = SYSTEM_PROMPT + "\n\nRow: \"%s\"\nInstruction: \"%s\"\n\nParse into the JSON only."
-                .formatted(req.rowLabel(), req.instruction());
+        int currentYear = Year.now().getValue();
+        String fullPrompt = SYSTEM_PROMPT + "\n\nCurrent year: %d\nRow: \"%s\"\nInstruction: \"%s\"\n\nParse into the JSON only."
+                .formatted(currentYear, req.rowLabel(), req.instruction());
 
         ObjectNode body = objectMapper.createObjectNode();
         body.putArray("contents")
