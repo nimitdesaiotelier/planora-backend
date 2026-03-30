@@ -48,4 +48,6 @@ public record AskPlanRequest(
         /** When set, use this fiscal year's plan as the data source instead of basePlanId (same property). */
         Integer queryPlanYear,
         /** BUDGET | FORECAST | WHAT_IF — pairs with queryPlanYear */
-        String queryPlanType) {}
+        String queryPlanType,
+        /** Optional aggregation: grand | profit | department | category | type | coa_code | coa_name (overrides AI intent when set). */
+        String groupBy) {}

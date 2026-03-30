@@ -47,8 +47,15 @@ public class AiAskPlanService {
     private static final int DEFAULT_TOP_N = 25;
     private static final int MAX_TOP_N = 100;
 
+    /** Display / merge key when a grouping dimension is null or blank on a line. */
+    private static final String GROUP_KEY_NONE = "(none)";
+
     private static final Pattern COMPARE_WORDS = Pattern.compile(
             "\\b(compare|vs\\.?|versus|against)\\b", Pattern.CASE_INSENSITIVE);
+
+    /** Whole-word "total" / common typo "toal" for profit heuristic (avoid matching "totally"). */
+    private static final Pattern WORD_TOTAL = Pattern.compile("\\btotal\\b", Pattern.CASE_INSENSITIVE);
+    private static final Pattern WORD_TOAL = Pattern.compile("\\btoal\\b", Pattern.CASE_INSENSITIVE);
 
     private static String buildSystemPrompt() {
         int now = java.time.Year.now().getValue();
@@ -74,7 +81,7 @@ public class AiAskPlanService {
             + "  \"queryPlanYear\":number or null,\n"
             + "  \"queryPlanType\":\"BUDGET|FORECAST|WHAT_IF|null\",\n"
             + "  \"totalFilter\":\"any|zero|non_zero|null\",\n"
-            + "  \"groupBy\":\"department|category|type|null\",\n"
+            + "  \"groupBy\":\"grand|profit|department|category|type|coa_code|coa_name|null\",\n"
             + "  \"chartType\":\"bar|pie|line|null\"\n"
             + "}\n"
             + "Rules:\n"
@@ -84,13 +91,27 @@ public class AiAskPlanService {
             + "  \"!Rooms\" = exclude Rooms, \"Rooms|F&B\" = either Rooms or F&B,\n"
             + "  \"^41\" = starts with 41, \"=4100\" = exact match.\n"
             + "  Default (no prefix) = case-insensitive contains.\n"
+            + "- Department synonyms (backend also maps these): F&B / FandB / food & beverage / food and beverage / food & department; "
+            + "non-operating / non operating / Non Operating; "
+            + "Sales and Marketing / sales / marketing / s and m / s&m; "
+            + "Other Operated Departments / other department / operated department (incl. typo operted); "
+            + "Property Operations and Maintenance / property / operation(s) / maintenance or typo maintence; "
+            + "Utilities / utility / typo utilites or utilty; "
+            + "\"food and utility\" (or utilities) together matches both Food &amp; Beverage and Utilities departments.\n"
             + "- Use plan_exists when the user asks whether a budget/forecast/plan exists for a year (do we have, is there, any plan).\n"
             + "- Use queryPlanYear and queryPlanType when the user wants analytics for a specific fiscal plan year without comparing (e.g. show statistics for Budget 2025); keep compareMode none.\n"
             + "- Use compare_plan only when the user explicitly compares plans (compare, vs, versus, against).\n"
             + "- Use compare_actuals for plan-vs-actual requests.\n"
             + "- Use top_n when user asks for top/bottom style ranking.\n"
+            + "- When the user asks for top N per department (phrases like \"per department\", \"each department\", \"department each\", or \"... department each\"), keep groupBy null for line items and set topN to N; the backend applies the limit inside each department.\n"
             + "- Use filter when user asks for constrained subsets (by category/type/text).\n"
-            + "- Use groupBy when user asks for totals/breakdown by department, category, or account type.\n"
+            + "- groupBy controls row aggregation (rolled-up result rows), not zero filtering:\n"
+            + "  * grand (aliases: grand_total) - one total row over all matched lines after filters. Use for \"total revenue\" OR \"total expense\" alone, \"grand total\", \"sum of ...\", \"how much total\" (when not breaking down by a dimension).\n"
+            + "  * department | category | type - one row per distinct value of that dimension.\n"
+            + "  * coa_code - one row per COA / GL code; coa_name - one row per account name.\n"
+            + "  * profit (aliases: pnl, p_and_l, profit_loss) - Revenue in baseValues, Expense in compareValues; deltaVsCompare = revenue minus expense. Use for \"total revenue and expense\", P&amp;L, and \"revenue and expense by department\" (multiple profit rows). Use profit when the user asks which departments have expenses/costs greater than revenue (or similar); lineTypes must include both Revenue and Expense; compareMode none. Prefer profit over department when both revenue and expense appear with a department breakdown. compareMode must be none; do not combine with plan-vs-plan or plan-vs-actuals.\n"
+            + "  * null - return individual line items (no roll-up).\n"
+            + "- totalFilter is ONLY for filtering lines by whether their plan sum is zero: any | zero | non_zero. Do NOT use totalFilter for questions that ask for a total dollar amount; use groupBy grand with the right lineTypes instead.\n"
             + "- Set chartType when user asks for a chart, graph, plot, or visualization. Use \"bar\" for comparisons, \"pie\" for proportions/shares, \"line\" for trends over time. Default to \"line\" if chart is requested but type is unclear.\n"
             + "- If unclear, use unknown.\n"
             + "Respond with valid JSON only.";
@@ -121,8 +142,11 @@ public class AiAskPlanService {
     @Transactional(readOnly = true)
     public AskPlanResponse ask(AskPlanRequest req) {
         ParsedAskIntent aiIntent = parseIntent(req.provider(), req.question());
-        ParsedAskIntent intent = resolveRelativeYearsIfMissing(
-                mergeWithOverrides(aiIntent, req), req.question());
+        ParsedAskIntent intent = applyFoodAndUtilitiesCombinedDepartmentHeuristic(
+                applyExpenseGreaterThanRevenueProfitHeuristic(
+                        resolveRelativeYearsIfMissing(mergeWithOverrides(aiIntent, req), req.question()),
+                        req.question()),
+                req.question());
 
         Plan anchorPlan = planRepository.findById(req.basePlanId())
                 .orElseThrow(() -> new EntityNotFoundException("Plan not found: " + req.basePlanId()));
@@ -132,6 +156,7 @@ public class AiAskPlanService {
         }
 
         if ("unknown".equals(intent.intent())
+                && normalizeGroupBy(intent.groupBy()) == null
                 && intent.topN() == null
                 && (intent.lineTypes() == null || intent.lineTypes().isEmpty())
                 && intent.category() == null
@@ -140,7 +165,7 @@ public class AiAskPlanService {
                 && intent.queryPlanYear() == null
                 && !"plan".equals(intent.compareMode())
                 && !"actuals".equals(intent.compareMode())) {
-            throw new IllegalArgumentException("Could not understand query intent. Try asking with clearer compare/filter terms.");
+            throw new IllegalArgumentException("That is not a valid action instruction. Please try again with a clear action.");
         }
 
         Plan basePlan = anchorPlan;
@@ -171,35 +196,58 @@ public class AiAskPlanService {
         Map<String, PlanMonthlyDetails> compareByKey = comparePlanId == null
                 ? Map.of()
                 : lineItemRepository.findByPlan_Id(comparePlanId).stream()
-                        .collect(LinkedHashMap::new, (m, li) -> m.put(li.getLineKey(), li), Map::putAll);
+                        .collect(LinkedHashMap::new, (m, li) -> m.put(effectiveCoaCode(li), li), Map::putAll);
 
         Integer actualYear = intent.actualYear() != null ? intent.actualYear() : basePlan.getFiscalYear();
         boolean includeActuals = Boolean.TRUE.equals(intent.includeActuals())
                 || "actuals".equals(intent.compareMode())
+                || "actual".equals(intent.compareMode())
                 || intent.actualYear() != null;
         Map<String, Map<String, Integer>> actualsByKey = includeActuals
                 ? loadActualsByLineKey(actualYear, basePlan.getProperty().getId(), DEFAULT_ORG_ID)
                 : Map.of();
 
+        if ("profit".equals(normalizeGroupBy(intent.groupBy()))) {
+            if (comparePlanId != null) {
+                throw new IllegalArgumentException(
+                        "Profit summary cannot be combined with plan comparison.");
+            }
+            if ("actuals".equals(intent.compareMode()) || "actual".equals(intent.compareMode())) {
+                throw new IllegalArgumentException(
+                        "Profit summary cannot be combined with plan-vs-actuals.");
+            }
+            if (Boolean.TRUE.equals(intent.includeActuals())) {
+                throw new IllegalArgumentException(
+                        "Profit summary cannot be combined with includeActuals.");
+            }
+        }
+
         List<String> periodMonths = monthsForPeriod(normalizePeriod(intent.period()));
         boolean isFullYear = periodMonths.equals(PlanMonthlyDetails.MONTH_KEYS);
 
-        List<AskPlanRowDto> rows = baseRows.stream()
+        List<AskPlanRowDto> matchedRows = baseRows.stream()
                 .filter(li -> matchesLineTypes(li, intent.lineTypes()))
                 .filter(li -> matchesCategory(li, intent.category()))
                 .filter(li -> matchesDepartment(li, intent.department()))
                 .filter(li -> matchesCoaCode(li, intent.coaCode()))
                 .filter(li -> matchesCoaName(li, intent.coaName()))
                 .filter(li -> matchesSearchText(li, intent.searchText()))
-                .map(li -> toResultRow(li, compareByKey.get(li.getLineKey()),
-                        actualsByKey.get(li.getLineKey()), isFullYear ? null : periodMonths))
+                .map(li -> toResultRow(li, compareByKey.get(effectiveCoaCode(li)),
+                        actualsByKey.get(effectiveCoaCode(li)), isFullYear ? null : periodMonths))
                 .filter(row -> matchesTotalFilter(row, intent.totalFilter(),
                         intent.totalFilterMonths(), intent.period()))
-                .sorted(sorter(intent))
                 .toList();
 
-        int effectiveTopN = clampTopN(intent.topN());
-        List<AskPlanRowDto> limited = rows.stream().limit(effectiveTopN).toList();
+        String effectiveGroupBy = normalizeGroupBy(intent.groupBy());
+        List<AskPlanRowDto> rowsForLimit = buildResultRowsAfterGrouping(
+                matchedRows, effectiveGroupBy, intent, periodMonths, isFullYear, req.question());
+
+        Comparator<AskPlanRowDto> rowComparator = sorter(intent);
+        Integer effectiveTopN = intent.topN() != null ? clampTopN(intent.topN()) : null;
+        boolean aggregated = effectiveGroupBy != null;
+        List<AskPlanRowDto> limited =
+                applyTopNLimit(
+                        rowsForLimit, intent, rowComparator, effectiveTopN, aggregated, req.question());
 
         Map<String, Object> appliedFilters = new LinkedHashMap<>();
         appliedFilters.put("period", normalizePeriod(intent.period()));
@@ -220,7 +268,7 @@ public class AiAskPlanService {
         appliedFilters.put("queryPlanType", intent.queryPlanType());
         appliedFilters.put("totalFilter", intent.totalFilter());
         appliedFilters.put("totalFilterMonths", intent.totalFilterMonths());
-        appliedFilters.put("groupBy", intent.groupBy());
+        appliedFilters.put("groupBy", effectiveGroupBy);
 
         Map<String, Object> meta = new LinkedHashMap<>();
         meta.put("basePlanId", basePlan.getId());
@@ -228,23 +276,27 @@ public class AiAskPlanService {
         meta.put("comparePlanId", comparePlanId);
         meta.put("actualYear", includeActuals ? actualYear : null);
         meta.put("resultCount", limited.size());
-        meta.put("totalMatchedBeforeLimit", rows.size());
+        meta.put("totalMatchedBeforeLimit", matchedRows.size());
 
-        if (intent.groupBy() != null) {
+        if (effectiveGroupBy != null) {
             Map<String, Long> grouped = new LinkedHashMap<>();
-            for (AskPlanRowDto row : rows) {
-                String key = resolveGroupKey(row, intent.groupBy());
+            for (AskPlanRowDto row : matchedRows) {
+                String key = resolveGroupKey(row, effectiveGroupBy);
                 grouped.merge(key, (long) sumMonths(row.baseValues(), periodMonths), Long::sum);
             }
             meta.put("groupedTotals", grouped);
-            meta.put("groupBy", intent.groupBy());
+            meta.put("groupBy", effectiveGroupBy);
         }
 
         // TODO: re-enable chart support after improving AI prompt accuracy
         meta.put("isChart", false);
         meta.put("chartType", null);
 
-        String summary = buildSummary(intent, limited.size(), effectiveTopN);
+        boolean topNPerLineType = effectiveTopN != null
+                && !aggregated
+                && intent.lineTypes() != null
+                && intent.lineTypes().size() > 1;
+        String summary = buildSummary(intent, limited.size(), effectiveTopN, topNPerLineType);
         return new AskPlanResponse(summary, intent.intent(), appliedFilters, limited, meta);
     }
 
@@ -390,12 +442,696 @@ public class AiAskPlanService {
         }
         PlanType type = parsePlanType(intent.comparePlanType()).orElse(PlanType.BUDGET);
         return planRepository
-                .findFirstByProperty_IdAndFiscalYearAndPlanTypeOrderByIdAsc(
-                        basePlan.getProperty().getId(), intent.comparePlanYear(), type)
+                .findFirstByProperty_IdAndFiscalYearAndPlanTypeAndStatusOrderByIdAsc(
+                        basePlan.getProperty().getId(), intent.comparePlanYear(), type, PlanStatus.ACTIVE)
                 .map(Plan::getId);
     }
 
+    private static String effectiveCoaCode(PlanMonthlyDetails li) {
+        return li.getCoaCode() != null && !li.getCoaCode().isBlank()
+                ? li.getCoaCode()
+                : li.getLineKey();
+    }
+
     // ── sorter / row building / actuals ─────────────────────────────────
+
+    /**
+     * When {@code topN} is set and multiple line types are filtered, returns up to {@code topN} rows
+     * per type (in line-types filter order). When the question asks for top N per department (e.g. "each
+     * department"), applies that limit within each department bucket. Otherwise applies a single global limit.
+     */
+    private static List<AskPlanRowDto> applyTopNLimit(
+            List<AskPlanRowDto> matchedRows,
+            ParsedAskIntent intent,
+            Comparator<AskPlanRowDto> rowComparator,
+            Integer effectiveTopN,
+            boolean aggregated,
+            String question) {
+        if (effectiveTopN == null) {
+            return matchedRows.stream().sorted(rowComparator).toList();
+        }
+        List<String> lineTypes = intent.lineTypes();
+        if (!aggregated && wantsTopNPerDepartment(question)) {
+            Map<String, List<AskPlanRowDto>> byDept = new LinkedHashMap<>();
+            for (AskPlanRowDto r : matchedRows) {
+                String key = nullSafeGroupKey(r.department());
+                byDept.computeIfAbsent(key, k -> new ArrayList<>()).add(r);
+            }
+            List<AskPlanRowDto> out = new ArrayList<>();
+            for (List<AskPlanRowDto> bucket : byDept.values()) {
+                if (lineTypes != null && lineTypes.size() > 1) {
+                    for (String lineType : lineTypes) {
+                        bucket.stream()
+                                .filter(r -> r.type() != null && r.type().equalsIgnoreCase(lineType))
+                                .sorted(rowComparator)
+                                .limit(effectiveTopN)
+                                .forEach(out::add);
+                    }
+                } else {
+                    bucket.stream()
+                            .sorted(rowComparator)
+                            .limit(effectiveTopN)
+                            .forEach(out::add);
+                }
+            }
+            return out.stream().sorted(rowComparator).toList();
+        }
+        if (!aggregated && lineTypes != null && lineTypes.size() > 1) {
+            List<AskPlanRowDto> out = new ArrayList<>();
+            for (String lineType : lineTypes) {
+                matchedRows.stream()
+                        .filter(r -> r.type().equalsIgnoreCase(lineType))
+                        .sorted(rowComparator)
+                        .limit(effectiveTopN)
+                        .forEach(out::add);
+            }
+            return out;
+        }
+        return matchedRows.stream().sorted(rowComparator).limit(effectiveTopN).toList();
+    }
+
+    /**
+     * True when the user wants up to top N rows within each department (not N rows overall), e.g.
+     * "top 2 expenses ... department each" or "per department".
+     */
+    private static boolean wantsTopNPerDepartment(String question) {
+        if (question == null || question.isBlank()) {
+            return false;
+        }
+        String s = question.toLowerCase(Locale.ROOT);
+        if (s.contains("per department")) {
+            return true;
+        }
+        if (s.contains("each department") || s.contains("department each") || s.contains("departments each")) {
+            return true;
+        }
+        if ((s.contains(" each") || s.endsWith("each"))
+                && (s.contains("department") || s.contains("departments") || s.contains("dept"))) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * After filters, either pass detail rows through or build one row per group / grand total.
+     */
+    private static List<AskPlanRowDto> buildResultRowsAfterGrouping(
+            List<AskPlanRowDto> matchedRows,
+            String effectiveGroupBy,
+            ParsedAskIntent intent,
+            List<String> periodMonths,
+            boolean isFullYear,
+            String question) {
+        if (effectiveGroupBy == null) {
+            return matchedRows;
+        }
+        if (matchedRows.isEmpty()) {
+            return List.of();
+        }
+        if ("profit".equals(effectiveGroupBy)) {
+            String q = question == null ? "" : question.toLowerCase(Locale.ROOT);
+            boolean filterExpenseGreaterThanRevenue = expenseComparedAboveRevenue(q);
+            boolean perDepartment = wantsProfitByDepartmentBreakdown(question)
+                    || (filterExpenseGreaterThanRevenue && questionReferencesDepartment(q));
+            if (perDepartment) {
+                Map<String, List<AskPlanRowDto>> byDept = new LinkedHashMap<>();
+                for (AskPlanRowDto row : matchedRows) {
+                    String key = resolveGroupKey(row, "department");
+                    byDept.computeIfAbsent(key, k -> new ArrayList<>()).add(row);
+                }
+                List<AskPlanRowDto> profitRows = new ArrayList<>();
+                for (Map.Entry<String, List<AskPlanRowDto>> e : byDept.entrySet()) {
+                    profitRows.add(buildProfitSyntheticRow(
+                            e.getValue(), isFullYear ? null : periodMonths, intent, e.getKey()));
+                }
+                if (filterExpenseGreaterThanRevenue) {
+                    profitRows.removeIf(row -> !expenseExceedsRevenueOnRow(row, periodMonths));
+                }
+                return profitRows;
+            }
+            AskPlanRowDto single =
+                    buildProfitSyntheticRow(matchedRows, isFullYear ? null : periodMonths, intent, null);
+            if (filterExpenseGreaterThanRevenue && !expenseExceedsRevenueOnRow(single, periodMonths)) {
+                return List.of();
+            }
+            return List.of(single);
+        }
+        if ("grand".equals(effectiveGroupBy)) {
+            String label = grandTotalLabel(intent);
+            String scopedDept = inferDepartmentForScopedAggregate(matchedRows, intent.department());
+            return List.of(aggregateAskPlanRows(
+                    matchedRows,
+                    "__grand__",
+                    label,
+                    scopedDept,
+                    null,
+                    null,
+                    mergedLineType(matchedRows),
+                    null,
+                    isFullYear ? null : periodMonths));
+        }
+        Map<String, List<AskPlanRowDto>> buckets = new LinkedHashMap<>();
+        for (AskPlanRowDto row : matchedRows) {
+            String key = resolveGroupKey(row, effectiveGroupBy);
+            buckets.computeIfAbsent(key, k -> new ArrayList<>()).add(row);
+        }
+        List<AskPlanRowDto> out = new ArrayList<>();
+        for (Map.Entry<String, List<AskPlanRowDto>> e : buckets.entrySet()) {
+            out.add(buildSyntheticGroupRow(
+                    e.getKey(), e.getValue(), effectiveGroupBy, isFullYear ? null : periodMonths, intent));
+        }
+        return out;
+    }
+
+    /**
+     * When rolled-up rows all belong to one department (or a simple department filter applies), expose it on
+     * synthetic totals (profit / grand).
+     */
+    private static String inferDepartmentForScopedAggregate(
+            List<AskPlanRowDto> matchedRows, String intentDepartment) {
+        if (matchedRows == null || matchedRows.isEmpty()) {
+            return null;
+        }
+        Set<String> distinct = new LinkedHashSet<>();
+        for (AskPlanRowDto r : matchedRows) {
+            String d = r.department();
+            if (d != null && !d.isBlank()) {
+                distinct.add(d.trim());
+            }
+        }
+        if (distinct.size() == 1) {
+            return distinct.iterator().next();
+        }
+        if (distinct.isEmpty()
+                && intentDepartment != null
+                && !intentDepartment.isBlank()
+                && !departmentFilterUsesAdvancedSyntax(intentDepartment)) {
+            return intentDepartment.trim();
+        }
+        return null;
+    }
+
+    /** True when the user asked for a department breakdown together with profit-style totals. */
+    private static boolean wantsProfitByDepartmentBreakdown(String question) {
+        if (question == null || question.isBlank()) {
+            return false;
+        }
+        String s = question.toLowerCase(Locale.ROOT);
+        return s.contains("by department")
+                || s.contains("per department")
+                || s.contains("department-wise")
+                || s.contains("for each department")
+                || s.contains("each department");
+    }
+
+    /**
+     * True when the question references departments (including "which department(s)") so profit should be split
+     * by department — e.g. departments where expense exceeds revenue.
+     */
+    private static boolean questionReferencesDepartment(String s) {
+        if (s == null || s.isBlank()) {
+            return false;
+        }
+        return s.contains("department")
+                || s.contains("departments")
+                || s.contains("dept ")
+                || s.startsWith("dept ")
+                || s.contains(" depts");
+    }
+
+    /**
+     * True when the user is asking for cases where expense/cost exceeds revenue (not revenue exceeding expense).
+     * Handles common phrasing and typo "grater".
+     */
+    private static boolean expenseComparedAboveRevenue(String s) {
+        if (s == null || s.isBlank()) {
+            return false;
+        }
+        if (!s.contains("revenue")) {
+            return false;
+        }
+        boolean expenseSide = s.contains("expense")
+                || s.contains("expenses")
+                || s.contains("cost")
+                || s.contains("costs")
+                || s.contains("spending");
+        if (!expenseSide) {
+            return false;
+        }
+        if (expenseExceedsRevenueViaExceedVerb(s)) {
+            return true;
+        }
+        int thanIdx = s.indexOf(" than ");
+        if (thanIdx < 0) {
+            thanIdx = s.indexOf("than ");
+        }
+        if (thanIdx < 0) {
+            return false;
+        }
+        int revIdx = s.indexOf("revenue");
+        int expIdx = indexOfExpenseSideWord(s);
+        if (revIdx < 0 || expIdx < 0) {
+            return false;
+        }
+        String beforeThan = s.substring(0, thanIdx);
+        boolean comparativeNearThan = beforeThan.contains("greater")
+                || beforeThan.contains("grater")
+                || beforeThan.contains("more ")
+                || beforeThan.contains("more than")
+                || beforeThan.contains("higher")
+                || beforeThan.contains("larger");
+        if (!comparativeNearThan) {
+            return false;
+        }
+        if (revIdx < thanIdx && expIdx > thanIdx) {
+            return false;
+        }
+        return expIdx < thanIdx && revIdx > thanIdx;
+    }
+
+    private static int indexOfExpenseSideWord(String s) {
+        int best = Integer.MAX_VALUE;
+        String[] words = {"expenses", "expense", "spending", "costs", "cost"};
+        for (String w : words) {
+            int i = s.indexOf(w);
+            if (i >= 0 && i < best) {
+                best = i;
+            }
+        }
+        return best == Integer.MAX_VALUE ? -1 : best;
+    }
+
+    private static boolean expenseExceedsRevenueViaExceedVerb(String s) {
+        int revIdx = s.indexOf("revenue");
+        if (revIdx < 0) {
+            return false;
+        }
+        int expIdx = indexOfExpenseSideWord(s);
+        if (expIdx < 0 || expIdx >= revIdx) {
+            return false;
+        }
+        int exceedsIdx = s.indexOf("exceeds");
+        int exceedSpace = s.indexOf("exceed ");
+        int verbIdx = exceedsIdx >= 0 ? exceedsIdx : exceedSpace;
+        if (verbIdx < 0) {
+            return false;
+        }
+        return expIdx < verbIdx && verbIdx < revIdx;
+    }
+
+    /** True on a profit-style row when compare (expense) total is strictly greater than base (revenue). */
+    private static boolean expenseExceedsRevenueOnRow(AskPlanRowDto row, List<String> periodMonths) {
+        if (periodMonths != null && !periodMonths.isEmpty()) {
+            Integer rev = row.periodTotal();
+            Integer exp = row.comparePeriodTotal();
+            if (rev != null && exp != null) {
+                return exp > rev;
+            }
+        }
+        Integer rev = row.baseTotal();
+        Integer exp = row.compareTotal();
+        if (rev != null && exp != null) {
+            return exp > rev;
+        }
+        Integer d = row.deltaVsCompare();
+        return d != null && d < 0;
+    }
+
+    /**
+     * When the question asks for expense &gt; revenue, force profit semantics (Revenue + Expense line types,
+     * groupBy profit) so results match other profit queries even if the model chose department or grand.
+     */
+    private static ParsedAskIntent applyExpenseGreaterThanRevenueProfitHeuristic(
+            ParsedAskIntent intent, String question) {
+        if (question == null || question.isBlank()) {
+            return intent;
+        }
+        String s = question.toLowerCase(Locale.ROOT);
+        if (!expenseComparedAboveRevenue(s)) {
+            return intent;
+        }
+        LinkedHashSet<String> lt = new LinkedHashSet<>();
+        if (intent.lineTypes() != null) {
+            lt.addAll(intent.lineTypes());
+        }
+        lt.add("Revenue");
+        lt.add("Expense");
+        String ng = normalizeGroupBy(intent.groupBy());
+        String newGroupBy = intent.groupBy();
+        if (ng == null || "department".equals(ng) || "grand".equals(ng)) {
+            newGroupBy = "profit";
+        }
+        return new ParsedAskIntent(
+                intent.intent(),
+                List.copyOf(lt),
+                intent.category(),
+                intent.department(),
+                intent.coaCode(),
+                intent.coaName(),
+                intent.period(),
+                intent.topN(),
+                intent.includeActuals(),
+                intent.compareMode(),
+                intent.actualYear(),
+                intent.comparePlanYear(),
+                intent.comparePlanType(),
+                intent.rankMode(),
+                intent.searchText(),
+                intent.queryPlanYear(),
+                intent.queryPlanType(),
+                intent.totalFilter(),
+                intent.totalFilterMonths(),
+                newGroupBy,
+                intent.chartType());
+    }
+
+    /**
+     * When the question mentions both food (F&amp;B) and utilities but intent only targets one side (or
+     * {@code searchText} is utility-only), align filters with the documented combined-department behavior.
+     */
+    private static ParsedAskIntent applyFoodAndUtilitiesCombinedDepartmentHeuristic(
+            ParsedAskIntent intent, String question) {
+        if (question == null || question.isBlank()) {
+            return intent;
+        }
+        if (!mentionsFoodAndUtilitiesTogether(question)) {
+            return intent;
+        }
+        String dept = intent.department();
+        if (dept != null && departmentFilterUsesAdvancedSyntax(dept)) {
+            if (!shouldClearUtilitiesOnlySearchText(intent.searchText())) {
+                return intent;
+            }
+            return new ParsedAskIntent(
+                    intent.intent(),
+                    intent.lineTypes(),
+                    intent.category(),
+                    intent.department(),
+                    intent.coaCode(),
+                    intent.coaName(),
+                    intent.period(),
+                    intent.topN(),
+                    intent.includeActuals(),
+                    intent.compareMode(),
+                    intent.actualYear(),
+                    intent.comparePlanYear(),
+                    intent.comparePlanType(),
+                    intent.rankMode(),
+                    null,
+                    intent.queryPlanYear(),
+                    intent.queryPlanType(),
+                    intent.totalFilter(),
+                    intent.totalFilterMonths(),
+                    intent.groupBy(),
+                    intent.chartType());
+        }
+        String newDept = dept;
+        if (dept == null || dept.isBlank() || !mentionsFoodAndUtilitiesTogether(dept)) {
+            newDept = "food and utility";
+        }
+        String newSearchText = intent.searchText();
+        if (shouldClearUtilitiesOnlySearchText(newSearchText)) {
+            newSearchText = null;
+        }
+        if (Objects.equals(dept, newDept) && Objects.equals(intent.searchText(), newSearchText)) {
+            return intent;
+        }
+        return new ParsedAskIntent(
+                intent.intent(),
+                intent.lineTypes(),
+                intent.category(),
+                newDept,
+                intent.coaCode(),
+                intent.coaName(),
+                intent.period(),
+                intent.topN(),
+                intent.includeActuals(),
+                intent.compareMode(),
+                intent.actualYear(),
+                intent.comparePlanYear(),
+                intent.comparePlanType(),
+                intent.rankMode(),
+                newSearchText,
+                intent.queryPlanYear(),
+                intent.queryPlanType(),
+                intent.totalFilter(),
+                intent.totalFilterMonths(),
+                intent.groupBy(),
+                intent.chartType());
+    }
+
+    /** True when searchText would resolve to utilities only, which would incorrectly exclude F&amp;B rows. */
+    private static boolean shouldClearUtilitiesOnlySearchText(String searchText) {
+        if (searchText == null || searchText.isBlank()) {
+            return false;
+        }
+        String n = normalizeDepartmentForAlias(searchText);
+        if (mentionsFoodAndUtilitiesTogether(n)) {
+            return false;
+        }
+        return resolveUtilitiesAliasKey(n) != null;
+    }
+
+    private static String profitLineKeyForDepartmentBucket(String departmentBucketKey) {
+        if (departmentBucketKey == null) {
+            return "__profit__";
+        }
+        String safe = departmentBucketKey.replace(':', '_');
+        return "__profit__:" + safe;
+    }
+
+    /**
+     * One row: base = summed Revenue baseValues; compare = summed Expense baseValues (not second plan).
+     * Assumes revenue and expense amounts are stored as positive magnitudes in the plan.
+     *
+     * @param departmentBucketKey when non-null, profit for that department bucket only (lineKey and department set);
+     *                            null = single global profit row.
+     */
+    private static AskPlanRowDto buildProfitSyntheticRow(
+            List<AskPlanRowDto> matchedRows,
+            List<String> periodMonths,
+            ParsedAskIntent intent,
+            String departmentBucketKey) {
+        List<Map<String, Integer>> revenueMaps = new ArrayList<>();
+        List<Map<String, Integer>> expenseMaps = new ArrayList<>();
+        for (AskPlanRowDto r : matchedRows) {
+            String t = r.type();
+            if (t == null) {
+                continue;
+            }
+            if ("Revenue".equalsIgnoreCase(t)) {
+                revenueMaps.add(r.baseValues());
+            } else if ("Expense".equalsIgnoreCase(t)) {
+                expenseMaps.add(r.baseValues());
+            }
+        }
+        Map<String, Integer> baseValues = mergeMonthValueMaps(revenueMaps);
+        Map<String, Integer> compareValues = mergeMonthValueMaps(expenseMaps);
+        Integer baseTotal = sumMonths(baseValues, PlanMonthlyDetails.MONTH_KEYS);
+        Integer compareTotal = sumMonths(compareValues, PlanMonthlyDetails.MONTH_KEYS);
+        Integer deltaVsCompare = baseTotal - compareTotal;
+        Integer periodTotal = periodMonths != null ? sumMonths(baseValues, periodMonths) : null;
+        Integer comparePeriodTotal = periodMonths != null ? sumMonths(compareValues, periodMonths) : null;
+        String department =
+                departmentBucketKey != null
+                        ? departmentBucketKey
+                        : inferDepartmentForScopedAggregate(matchedRows, intent.department());
+        String lineKey = profitLineKeyForDepartmentBucket(departmentBucketKey);
+        return new AskPlanRowDto(
+                lineKey,
+                department,
+                null,
+                null,
+                "Profit",
+                null,
+                null,
+                baseValues,
+                baseTotal,
+                periodTotal,
+                compareValues,
+                compareTotal,
+                comparePeriodTotal,
+                deltaVsCompare,
+                null,
+                null,
+                null,
+                null);
+    }
+
+    private static AskPlanRowDto buildSyntheticGroupRow(
+            String groupKey,
+            List<AskPlanRowDto> rows,
+            String groupBy,
+            List<String> periodMonths,
+            ParsedAskIntent intent) {
+        String lineKey = syntheticLineKey(groupBy, groupKey);
+        String label = "department".equals(groupBy) ? null : groupKey;
+        String department = null;
+        String coaCode = null;
+        String coaName = null;
+        String category = null;
+        String type = null;
+        if ("department".equals(groupBy)) {
+            department = groupKey;
+        } else if ("category".equals(groupBy)) {
+            category = groupKey;
+        } else if ("type".equals(groupBy)) {
+            type = groupKey;
+        } else if ("coa_code".equals(groupBy)) {
+            coaCode = GROUP_KEY_NONE.equals(groupKey) ? null : groupKey;
+            coaName = firstNonBlankCoaName(rows);
+            department = inferDepartmentForScopedAggregate(rows, intent.department());
+            label = firstNonBlankForDisplay(coaName, firstNonBlankLabel(rows), coaCode, groupKey);
+        } else if ("coa_name".equals(groupBy)) {
+            coaName = GROUP_KEY_NONE.equals(groupKey) ? null : groupKey;
+            coaCode = firstNonBlankCoaCode(rows);
+            department = inferDepartmentForScopedAggregate(rows, intent.department());
+            label = firstNonBlankForDisplay(coaName, firstNonBlankLabel(rows), coaCode, groupKey);
+        }
+        if (!"type".equals(groupBy)) {
+            type = mergedLineType(rows);
+        }
+        return aggregateAskPlanRows(rows, lineKey, label, department, coaCode, coaName, type, category, periodMonths);
+    }
+
+    private static String firstNonBlankCoaName(List<AskPlanRowDto> rows) {
+        for (AskPlanRowDto r : rows) {
+            if (r.coaName() != null && !r.coaName().isBlank()) {
+                return r.coaName();
+            }
+        }
+        return null;
+    }
+
+    private static String firstNonBlankCoaCode(List<AskPlanRowDto> rows) {
+        for (AskPlanRowDto r : rows) {
+            if (r.coaCode() != null && !r.coaCode().isBlank()) {
+                return r.coaCode();
+            }
+        }
+        return null;
+    }
+
+    private static String firstNonBlankLabel(List<AskPlanRowDto> rows) {
+        for (AskPlanRowDto r : rows) {
+            if (r.label() != null && !r.label().isBlank()) {
+                return r.label();
+            }
+        }
+        return null;
+    }
+
+    private static String firstNonBlankForDisplay(String coaName, String lineLabel, String coaCode, String groupKey) {
+        if (coaName != null && !coaName.isBlank()) {
+            return coaName;
+        }
+        if (lineLabel != null && !lineLabel.isBlank()) {
+            return lineLabel;
+        }
+        if (coaCode != null && !coaCode.isBlank()) {
+            return coaCode;
+        }
+        return groupKey;
+    }
+
+    private static String grandTotalLabel(ParsedAskIntent intent) {
+        List<String> lt = intent.lineTypes();
+        if (lt != null && lt.size() == 1) {
+            return "Total - " + lt.get(0);
+        }
+        return "Grand total";
+    }
+
+    private static String syntheticLineKey(String groupBy, String groupKey) {
+        String safe = groupKey == null ? GROUP_KEY_NONE : groupKey.replace(':', '_');
+        return "__group__:" + groupBy + ":" + safe;
+    }
+
+    private static String mergedLineType(List<AskPlanRowDto> rows) {
+        Set<String> types = new LinkedHashSet<>();
+        for (AskPlanRowDto r : rows) {
+            if (r.type() != null && !r.type().isBlank()) {
+                types.add(r.type());
+            }
+        }
+        if (types.isEmpty()) {
+            return null;
+        }
+        if (types.size() == 1) {
+            return types.iterator().next();
+        }
+        return "Mixed";
+    }
+
+    private static Map<String, Integer> mergeMonthValueMaps(List<Map<String, Integer>> maps) {
+        Map<String, Integer> out = new LinkedHashMap<>();
+        for (Map<String, Integer> m : maps) {
+            if (m == null) {
+                continue;
+            }
+            for (Map.Entry<String, Integer> e : m.entrySet()) {
+                out.merge(e.getKey(), e.getValue() != null ? e.getValue() : 0, Integer::sum);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Sums monthly maps and totals; compare/actual fields are null unless every row in the group has that side.
+     */
+    private static AskPlanRowDto aggregateAskPlanRows(
+            List<AskPlanRowDto> rows,
+            String lineKey,
+            String label,
+            String department,
+            String coaCode,
+            String coaName,
+            String type,
+            String category,
+            List<String> periodMonths) {
+        List<Map<String, Integer>> baseMaps = rows.stream().map(AskPlanRowDto::baseValues).toList();
+        Map<String, Integer> baseValues = mergeMonthValueMaps(baseMaps);
+
+        boolean allCompare = !rows.isEmpty() && rows.stream().allMatch(r -> r.compareValues() != null);
+        Map<String, Integer> compareValues =
+                allCompare ? mergeMonthValueMaps(rows.stream().map(AskPlanRowDto::compareValues).toList()) : null;
+
+        boolean allActual = !rows.isEmpty() && rows.stream().allMatch(r -> r.actualValues() != null);
+        Map<String, Integer> actualValues =
+                allActual ? mergeMonthValueMaps(rows.stream().map(AskPlanRowDto::actualValues).toList()) : null;
+
+        Integer baseTotal = sumMonths(baseValues, PlanMonthlyDetails.MONTH_KEYS);
+        Integer compareTotal = compareValues == null ? null : sumMonths(compareValues, PlanMonthlyDetails.MONTH_KEYS);
+        Integer actualTotal = actualValues == null ? null : sumMonths(actualValues, PlanMonthlyDetails.MONTH_KEYS);
+        Integer deltaVsCompare = compareTotal == null ? null : (baseTotal - compareTotal);
+        Integer deltaVsActual = actualTotal == null ? null : (baseTotal - actualTotal);
+
+        Integer periodTotal = periodMonths != null ? sumMonths(baseValues, periodMonths) : null;
+        Integer comparePeriodTotal =
+                periodMonths != null && compareValues != null ? sumMonths(compareValues, periodMonths) : null;
+        Integer actualPeriodTotal =
+                periodMonths != null && actualValues != null ? sumMonths(actualValues, periodMonths) : null;
+
+        return new AskPlanRowDto(
+                lineKey,
+                department,
+                coaCode,
+                coaName,
+                label,
+                type,
+                category,
+                baseValues,
+                baseTotal,
+                periodTotal,
+                compareValues,
+                compareTotal,
+                comparePeriodTotal,
+                deltaVsCompare,
+                actualValues,
+                actualTotal,
+                actualPeriodTotal,
+                deltaVsActual);
+    }
 
     private Comparator<AskPlanRowDto> sorter(ParsedAskIntent intent) {
         List<String> months = monthsForPeriod(normalizePeriod(intent.period()));
@@ -437,11 +1173,16 @@ public class AiAskPlanService {
         Integer actualPeriodTotal = periodMonths != null && actualValues != null
                 ? sumMonths(actualValues, periodMonths) : null;
 
+        String coaName = base.getCoaName();
+        if (coaName == null || coaName.isBlank()) {
+            coaName = base.getLabel();
+        }
+
         return new AskPlanRowDto(
                 base.getLineKey(),
                 base.getDepartment(),
                 base.getCoaCode(),
-                base.getCoaName(),
+                coaName,
                 base.getLabel(),
                 base.getType().name(),
                 base.getCategory(),
@@ -546,7 +1287,181 @@ public class AiAskPlanService {
         return matchesFilterExpression(li.getCategory(), category);
     }
 
+    private static final String DEPT_ALIAS_FB = "DEPT_FB";
+    private static final String DEPT_ALIAS_NON_OP = "DEPT_NON_OP";
+    private static final String DEPT_ALIAS_SALES_MARKETING = "DEPT_SALES_MARKETING";
+    private static final String DEPT_ALIAS_OTHER_OPERATED = "DEPT_OTHER_OPERATED";
+    private static final String DEPT_ALIAS_PROPERTY_OPS_MAINT = "DEPT_PROPERTY_OPS_MAINT";
+    private static final String DEPT_ALIAS_UTILITIES = "DEPT_UTILITIES";
+
+    private static final Pattern WORD_SALES = Pattern.compile("\\bsales\\b", Pattern.CASE_INSENSITIVE);
+    private static final Pattern WORD_MARKETING = Pattern.compile("\\bmarketing\\b", Pattern.CASE_INSENSITIVE);
+    private static final Pattern WORD_PROPERTY = Pattern.compile("\\bproperty\\b", Pattern.CASE_INSENSITIVE);
+    private static final Pattern WORD_UTILITY = Pattern.compile("\\butility\\b", Pattern.CASE_INSENSITIVE);
+    private static final Pattern WORD_UTILITIES = Pattern.compile("\\butilities\\b", Pattern.CASE_INSENSITIVE);
+
+    private static boolean departmentFilterUsesAdvancedSyntax(String expression) {
+        if (expression == null) {
+            return false;
+        }
+        String e = expression.trim();
+        return e.startsWith("!") || e.startsWith("^") || e.startsWith("=") || e.contains("|");
+    }
+
+    /** Lowercase; & and - to spaces; collapse whitespace — for alias bucket detection only. */
+    static String normalizeDepartmentForAlias(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String s = raw.toLowerCase(Locale.ROOT).replace('&', ' ').replace('-', ' ');
+        return s.replaceAll("\\s+", " ").trim();
+    }
+
+    private static String collapseAlphaNum(String s) {
+        return s.replaceAll("[^a-z0-9]", "");
+    }
+
+    /**
+     * Canonical key when {@code raw} is a known department alias (F&amp;B, non-operating, sales/marketing, etc.);
+     * otherwise null.
+     */
+    static String resolveDepartmentAliasKey(String raw) {
+        String n = normalizeDepartmentForAlias(raw);
+        if (n.isEmpty()) {
+            return null;
+        }
+        if (n.contains("non operating")) {
+            return DEPT_ALIAS_NON_OP;
+        }
+        String collapsed = collapseAlphaNum(n);
+        if (collapsed.contains("nonoperating")) {
+            return DEPT_ALIAS_NON_OP;
+        }
+        String salesMarketingKey = resolveSalesMarketingAliasKey(n, collapsed);
+        if (salesMarketingKey != null) {
+            return salesMarketingKey;
+        }
+        String otherOperatedKey = resolveOtherOperatedAliasKey(n);
+        if (otherOperatedKey != null) {
+            return otherOperatedKey;
+        }
+        String propertyOpsKey = resolvePropertyOpsMaintAliasKey(n);
+        if (propertyOpsKey != null) {
+            return propertyOpsKey;
+        }
+        String utilitiesKey = resolveUtilitiesAliasKey(n);
+        if (utilitiesKey != null) {
+            return utilitiesKey;
+        }
+        if ("f b".equals(n) || "fandb".equals(n) || "fb".equals(n)) {
+            return DEPT_ALIAS_FB;
+        }
+        if (n.contains("food beverage") || n.contains("food and beverage")) {
+            return DEPT_ALIAS_FB;
+        }
+        if (n.contains("food department") || n.contains("food and department")) {
+            return DEPT_ALIAS_FB;
+        }
+        return null;
+    }
+
+    private static String resolveSalesMarketingAliasKey(String n, String collapsed) {
+        if (n.contains("s and m") || "s m".equals(n)) {
+            return DEPT_ALIAS_SALES_MARKETING;
+        }
+        if (n.contains("saless") || n.contains("marcketing")) {
+            return DEPT_ALIAS_SALES_MARKETING;
+        }
+        if (WORD_SALES.matcher(n).find() && WORD_MARKETING.matcher(n).find()) {
+            return DEPT_ALIAS_SALES_MARKETING;
+        }
+        if (WORD_MARKETING.matcher(n).find()) {
+            return DEPT_ALIAS_SALES_MARKETING;
+        }
+        if (WORD_SALES.matcher(n).find()) {
+            return DEPT_ALIAS_SALES_MARKETING;
+        }
+        if (collapsed.contains("sandm") && collapsed.length() <= 8) {
+            return DEPT_ALIAS_SALES_MARKETING;
+        }
+        return null;
+    }
+
+    private static String resolveOtherOperatedAliasKey(String n) {
+        if (n.contains("operted")) {
+            return DEPT_ALIAS_OTHER_OPERATED;
+        }
+        if (n.contains("other department")) {
+            return DEPT_ALIAS_OTHER_OPERATED;
+        }
+        if (n.contains("other operated")) {
+            return DEPT_ALIAS_OTHER_OPERATED;
+        }
+        if (n.contains("operated department")) {
+            return DEPT_ALIAS_OTHER_OPERATED;
+        }
+        return null;
+    }
+
+    private static String resolvePropertyOpsMaintAliasKey(String n) {
+        boolean hasProp = WORD_PROPERTY.matcher(n).find();
+        boolean hasOper =
+                n.contains("operation") || n.contains("operations");
+        boolean hasMaint = n.contains("maintenance") || n.contains("maintence");
+        if (hasProp && (hasOper || hasMaint)) {
+            return DEPT_ALIAS_PROPERTY_OPS_MAINT;
+        }
+        if ("property".equals(n)) {
+            return DEPT_ALIAS_PROPERTY_OPS_MAINT;
+        }
+        if ("maintenance".equals(n) || "maintence".equals(n)) {
+            return DEPT_ALIAS_PROPERTY_OPS_MAINT;
+        }
+        if ("operation".equals(n) || "operations".equals(n)) {
+            return DEPT_ALIAS_PROPERTY_OPS_MAINT;
+        }
+        return null;
+    }
+
+    private static String resolveUtilitiesAliasKey(String n) {
+        if (n.contains("utilty") || n.contains("utilites")) {
+            return DEPT_ALIAS_UTILITIES;
+        }
+        if (WORD_UTILITIES.matcher(n).find() || WORD_UTILITY.matcher(n).find()) {
+            return DEPT_ALIAS_UTILITIES;
+        }
+        return null;
+    }
+
+    /** True when filter/search mentions both food (F&amp;B) and utility/utilities in one phrase. */
+    private static boolean mentionsFoodAndUtilitiesTogether(String raw) {
+        String n = normalizeDepartmentForAlias(raw);
+        if (!n.contains("food")) {
+            return false;
+        }
+        return n.contains("utility") || n.contains("utilities");
+    }
+
+    private static boolean lineMatchesFoodOrUtilitiesDepartment(PlanMonthlyDetails li) {
+        String keyField = resolveDepartmentAliasKey(li.getDepartment());
+        return DEPT_ALIAS_FB.equals(keyField) || DEPT_ALIAS_UTILITIES.equals(keyField);
+    }
+
     private static boolean matchesDepartment(PlanMonthlyDetails li, String department) {
+        if (department == null || department.isBlank()) {
+            return true;
+        }
+        if (departmentFilterUsesAdvancedSyntax(department)) {
+            return matchesFilterExpression(li.getDepartment(), department);
+        }
+        if (mentionsFoodAndUtilitiesTogether(department) && lineMatchesFoodOrUtilitiesDepartment(li)) {
+            return true;
+        }
+        String keyFilter = resolveDepartmentAliasKey(department);
+        String keyField = resolveDepartmentAliasKey(li.getDepartment());
+        if (keyFilter != null && keyFilter.equals(keyField)) {
+            return true;
+        }
         return matchesFilterExpression(li.getDepartment(), department);
     }
 
@@ -562,11 +1477,43 @@ public class AiAskPlanService {
                 || matchesFilterExpression(li.getLabel(), coaName);
     }
 
+    /**
+     * Strips generic Ask Plan search noise (e.g. "department", "rows") so "show F&amp;B department rows"
+     * matches rows whose department is "F&amp;B".
+     */
+    private static String normalizeAskPlanSearchQuery(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return "";
+        }
+        String q = raw.trim().toLowerCase(Locale.ROOT);
+        String next;
+        do {
+            next = q.replaceAll(
+                            "\\b(department|departments|rows?|line\\s*items?|details?|for|from|in|the|all|my|show)\\b",
+                            " ")
+                    .replaceAll("\\s+", " ")
+                    .trim();
+            if (next.equals(q)) {
+                break;
+            }
+            q = next;
+        } while (true);
+        return q.isBlank() ? raw.trim().toLowerCase(Locale.ROOT) : q;
+    }
+
     private static boolean matchesSearchText(PlanMonthlyDetails li, String searchText) {
         if (searchText == null || searchText.isBlank()) {
             return true;
         }
-        String q = searchText.trim().toLowerCase(Locale.ROOT);
+        String q = normalizeAskPlanSearchQuery(searchText);
+        if (mentionsFoodAndUtilitiesTogether(q) && lineMatchesFoodOrUtilitiesDepartment(li)) {
+            return true;
+        }
+        String keyQ = resolveDepartmentAliasKey(q);
+        String keyDept = resolveDepartmentAliasKey(li.getDepartment());
+        if (keyQ != null && keyQ.equals(keyDept)) {
+            return true;
+        }
         if (li.getLabel().toLowerCase(Locale.ROOT).contains(q)
                 || li.getLineKey().toLowerCase(Locale.ROOT).contains(q)
                 || li.getDepartment().toLowerCase(Locale.ROOT).contains(q)
@@ -595,7 +1542,8 @@ public class AiAskPlanService {
         return Math.min(v, MAX_TOP_N);
     }
 
-    private static String buildSummary(ParsedAskIntent intent, int count, int topN) {
+    private static String buildSummary(
+            ParsedAskIntent intent, int count, Integer topN, boolean topNPerLineType) {
         String base;
         if ("compare_plan".equals(intent.intent())) {
             base = "Compared base plan with selected plan.";
@@ -608,7 +1556,13 @@ public class AiAskPlanService {
         } else {
             base = "Analyzed line items for the requested question.";
         }
-        return base + " Returned " + count + " row(s), capped at top " + topN + ".";
+        if (topN != null) {
+            if (topNPerLineType) {
+                return base + " Returned " + count + " row(s), up to " + topN + " per line type.";
+            }
+            return base + " Returned " + count + " row(s), capped at top " + topN + ".";
+        }
+        return base + " Returned " + count + " row(s).";
     }
 
     // ── intent parsing ──────────────────────────────────────────────────
@@ -867,7 +1821,7 @@ public class AiAskPlanService {
         Integer queryPlanYear = intVal(n, "queryPlanYear");
         String queryPlanType = text(n, "queryPlanType");
         String totalFilter = text(n, "totalFilter");
-        String groupBy = text(n, "groupBy");
+        String groupBy = normalizeGroupBy(blankToNull(text(n, "groupBy")));
         String chartType = text(n, "chartType");
         return new ParsedAskIntent(
                 blankToNull(intent),
@@ -889,7 +1843,7 @@ public class AiAskPlanService {
                 normalizePlanType(queryPlanType),
                 blankToNull(totalFilter),
                 null,
-                blankToNull(groupBy),
+                groupBy,
                 normalizeChartType(blankToNull(chartType)));
     }
 
@@ -984,7 +1938,7 @@ public class AiAskPlanService {
             }
         }
 
-        String groupBy = inferGroupBy(s);
+        String groupBy = normalizeGroupBy(inferGroupBy(s));
 
         String chartType = null;
         if (s.contains("chart") || s.contains("graph") || s.contains("plot") || s.contains("visuali")) {
@@ -997,6 +1951,15 @@ public class AiAskPlanService {
                 s.contains("revenue") ? "Revenue" : null,
                 s.contains("expense") ? "Expense" : null,
                 s.contains("statistics") ? "Statistics" : null), null);
+        if ("profit".equals(groupBy)) {
+            LinkedHashSet<String> lt = new LinkedHashSet<>();
+            if (lineTypes != null) {
+                lt.addAll(lineTypes);
+            }
+            lt.add("Revenue");
+            lt.add("Expense");
+            lineTypes = List.copyOf(lt);
+        }
         Integer topN = extractTopN(s);
         String searchText = extractSearchText(s);
         if (searchText == null && "filter".equals(intent)) {
@@ -1080,13 +2043,129 @@ public class AiAskPlanService {
     }
 
     private static String inferGroupBy(String s) {
-        if (s == null) return null;
-        if (s.contains("by department") || s.contains("department-wise")
-                || s.contains("per department")) return "department";
-        if (s.contains("by category") || s.contains("category-wise")
-                || s.contains("per category")) return "category";
-        if (s.contains("by type") || s.contains("type-wise")
-                || s.contains("per type") || s.contains("by account type")) return "type";
+        if (s == null) {
+            return null;
+        }
+        if (s.contains("net income")
+                || s.contains("bottom line")
+                || s.contains("profit and loss")
+                || s.contains("p&l")
+                || s.contains("p & l")
+                || s.contains("p/l")
+                || (s.contains("revenue") && s.contains("expense") && s.contains("profit"))) {
+            return "profit";
+        }
+        if (s.contains("profit") && (s.contains("revenue") || s.contains("expense"))) {
+            return "profit";
+        }
+        // Revenue + expense + department breakdown => profit (revenue in base, expense in compare), one row per department.
+        if (s.contains("revenue")
+                && s.contains("expense")
+                && (s.contains("by department")
+                        || s.contains("per department")
+                        || s.contains("department-wise")
+                        || s.contains("for each department")
+                        || s.contains("each department"))) {
+            return "profit";
+        }
+        // Expense/cost greater than revenue (e.g. which departments are loss-making on that definition).
+        if (expenseComparedAboveRevenue(s)) {
+            return "profit";
+        }
+        // Breakdown dimensions before "total + revenue + expense" -> profit, so other "by X" phrases still win over plain totals.
+        if (s.contains("by department")
+                || s.contains("department-wise")
+                || s.contains("per department")) {
+            return "department";
+        }
+        if (s.contains("by category")
+                || s.contains("category-wise")
+                || s.contains("per category")) {
+            return "category";
+        }
+        if (s.contains("by type")
+                || s.contains("type-wise")
+                || s.contains("per type")
+                || s.contains("by account type")) {
+            return "type";
+        }
+        if (s.contains("by coa name")
+                || s.contains("by account name")
+                || s.contains("per coa name")
+                || s.contains("per account name")
+                || s.contains("by gl name")) {
+            return "coa_name";
+        }
+        if (s.contains("by coa")
+                || s.contains("by gl")
+                || s.contains("per coa")
+                || s.contains("by account code")
+                || s.contains("by gl code")) {
+            return "coa_code";
+        }
+        if (s.contains("revenue")
+                && s.contains("expense")
+                && (WORD_TOTAL.matcher(s).find() || WORD_TOAL.matcher(s).find())) {
+            return "profit";
+        }
+        if (s.contains("grand total") || s.contains("grand_total")) {
+            return "grand";
+        }
+        if (s.contains("total revenue")
+                || s.contains("total expenses")
+                || s.contains("total expense")
+                || s.contains("total statistics")
+                || s.contains("sum of ")
+                || s.contains("sum of the ")
+                || s.contains("what's the total")
+                || s.contains("what is the total")
+                || s.contains("how much total")) {
+            return "grand";
+        }
+        return null;
+    }
+
+    /**
+     * Canonical aggregation dimension; unknown or empty tokens yield null (keep detail rows).
+     */
+    static String normalizeGroupBy(String raw) {
+        if (raw == null || raw.isBlank() || "null".equalsIgnoreCase(raw.trim())) {
+            return null;
+        }
+        String compact = raw.trim().toLowerCase(Locale.ROOT).replace('-', '_').replace(" ", "");
+        if ("grand".equals(compact) || "grand_total".equals(compact) || "grandtotal".equals(compact)) {
+            return "grand";
+        }
+        if ("coa_code".equals(compact) || "coacode".equals(compact)) {
+            return "coa_code";
+        }
+        if ("coa_name".equals(compact)
+                || "coaname".equals(compact)
+                || "account_name".equals(compact)
+                || "accountname".equals(compact)) {
+            return "coa_name";
+        }
+        if ("department".equals(compact) || "dept".equals(compact)) {
+            return "department";
+        }
+        if ("category".equals(compact)) {
+            return "category";
+        }
+        if ("type".equals(compact)
+                || "account_type".equals(compact)
+                || "accounttype".equals(compact)) {
+            return "type";
+        }
+        if ("profit".equals(compact)
+                || "pnl".equals(compact)
+                || "p_and_l".equals(compact)
+                || "pandl".equals(compact)
+                || "profit_loss".equals(compact)
+                || "profitloss".equals(compact)
+                || "netincome".equals(compact)
+                || "net_income".equals(compact)) {
+            return "profit";
+        }
         return null;
     }
 
@@ -1154,11 +2233,36 @@ public class AiAskPlanService {
         return "zero".equalsIgnoreCase(totalFilter) ? sum == 0 : sum != 0;
     }
 
+    private static String nullSafeGroupKey(String v) {
+        return (v == null || v.isBlank()) ? GROUP_KEY_NONE : v;
+    }
+
     private static String resolveGroupKey(AskPlanRowDto row, String groupBy) {
-        if ("department".equals(groupBy)) return row.department();
-        if ("category".equals(groupBy)) return row.category();
-        if ("type".equals(groupBy)) return row.type();
-        return "other";
+        if (groupBy == null) {
+            return GROUP_KEY_NONE;
+        }
+        if ("grand".equals(groupBy)) {
+            return "__grand__";
+        }
+        if ("profit".equals(groupBy)) {
+            return "__profit__";
+        }
+        if ("department".equals(groupBy)) {
+            return nullSafeGroupKey(row.department());
+        }
+        if ("category".equals(groupBy)) {
+            return nullSafeGroupKey(row.category());
+        }
+        if ("type".equals(groupBy)) {
+            return nullSafeGroupKey(row.type());
+        }
+        if ("coa_code".equals(groupBy)) {
+            return nullSafeGroupKey(row.coaCode());
+        }
+        if ("coa_name".equals(groupBy)) {
+            return nullSafeGroupKey(row.coaName() != null && !row.coaName().isBlank() ? row.coaName() : row.label());
+        }
+        return GROUP_KEY_NONE;
     }
 
     private static String inferPlanTypeFromKeywords(String s) {
@@ -1235,7 +2339,7 @@ public class AiAskPlanService {
                 coalesce(blankToNull(req.totalFilter()), ai.totalFilter()),
                 req.totalFilterMonths() != null && !req.totalFilterMonths().isEmpty()
                         ? req.totalFilterMonths() : ai.totalFilterMonths(),
-                ai.groupBy(),
+                normalizeGroupBy(coalesce(blankToNull(req.groupBy()), ai.groupBy())),
                 ai.chartType());
     }
 
