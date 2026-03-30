@@ -84,6 +84,8 @@ public class AiAskPlanService {
             + "  \"!Rooms\" = exclude Rooms, \"Rooms|F&B\" = either Rooms or F&B,\n"
             + "  \"^41\" = starts with 41, \"=4100\" = exact match.\n"
             + "  Default (no prefix) = case-insensitive contains.\n"
+            + "- Department synonyms (backend also maps these): F&B / FandB / food & beverage / food and beverage / food & department; "
+            + "non-operating / non operating / Non Operating.\n"
             + "- Use plan_exists when the user asks whether a budget/forecast/plan exists for a year (do we have, is there, any plan).\n"
             + "- Use queryPlanYear and queryPlanType when the user wants analytics for a specific fiscal plan year without comparing (e.g. show statistics for Budget 2025); keep compareMode none.\n"
             + "- Use compare_plan only when the user explicitly compares plans (compare, vs, versus, against).\n"
@@ -140,7 +142,7 @@ public class AiAskPlanService {
                 && intent.queryPlanYear() == null
                 && !"plan".equals(intent.compareMode())
                 && !"actuals".equals(intent.compareMode())) {
-            throw new IllegalArgumentException("Could not understand query intent. Try asking with clearer compare/filter terms.");
+            throw new IllegalArgumentException("That is not a valid action instruction. Please try again with a clear action.");
         }
 
         Plan basePlan = anchorPlan;
@@ -171,11 +173,12 @@ public class AiAskPlanService {
         Map<String, PlanMonthlyDetails> compareByKey = comparePlanId == null
                 ? Map.of()
                 : lineItemRepository.findByPlan_Id(comparePlanId).stream()
-                        .collect(LinkedHashMap::new, (m, li) -> m.put(li.getLineKey(), li), Map::putAll);
+                        .collect(LinkedHashMap::new, (m, li) -> m.put(effectiveCoaCode(li), li), Map::putAll);
 
         Integer actualYear = intent.actualYear() != null ? intent.actualYear() : basePlan.getFiscalYear();
         boolean includeActuals = Boolean.TRUE.equals(intent.includeActuals())
                 || "actuals".equals(intent.compareMode())
+                || "actual".equals(intent.compareMode())
                 || intent.actualYear() != null;
         Map<String, Map<String, Integer>> actualsByKey = includeActuals
                 ? loadActualsByLineKey(actualYear, basePlan.getProperty().getId(), DEFAULT_ORG_ID)
@@ -184,22 +187,22 @@ public class AiAskPlanService {
         List<String> periodMonths = monthsForPeriod(normalizePeriod(intent.period()));
         boolean isFullYear = periodMonths.equals(PlanMonthlyDetails.MONTH_KEYS);
 
-        List<AskPlanRowDto> rows = baseRows.stream()
+        List<AskPlanRowDto> matchedRows = baseRows.stream()
                 .filter(li -> matchesLineTypes(li, intent.lineTypes()))
                 .filter(li -> matchesCategory(li, intent.category()))
                 .filter(li -> matchesDepartment(li, intent.department()))
                 .filter(li -> matchesCoaCode(li, intent.coaCode()))
                 .filter(li -> matchesCoaName(li, intent.coaName()))
                 .filter(li -> matchesSearchText(li, intent.searchText()))
-                .map(li -> toResultRow(li, compareByKey.get(li.getLineKey()),
-                        actualsByKey.get(li.getLineKey()), isFullYear ? null : periodMonths))
+                .map(li -> toResultRow(li, compareByKey.get(effectiveCoaCode(li)),
+                        actualsByKey.get(effectiveCoaCode(li)), isFullYear ? null : periodMonths))
                 .filter(row -> matchesTotalFilter(row, intent.totalFilter(),
                         intent.totalFilterMonths(), intent.period()))
-                .sorted(sorter(intent))
                 .toList();
 
-        int effectiveTopN = clampTopN(intent.topN());
-        List<AskPlanRowDto> limited = rows.stream().limit(effectiveTopN).toList();
+        Comparator<AskPlanRowDto> rowComparator = sorter(intent);
+        Integer effectiveTopN = intent.topN() != null ? clampTopN(intent.topN()) : null;
+        List<AskPlanRowDto> limited = applyTopNLimit(matchedRows, intent, rowComparator, effectiveTopN);
 
         Map<String, Object> appliedFilters = new LinkedHashMap<>();
         appliedFilters.put("period", normalizePeriod(intent.period()));
@@ -228,11 +231,11 @@ public class AiAskPlanService {
         meta.put("comparePlanId", comparePlanId);
         meta.put("actualYear", includeActuals ? actualYear : null);
         meta.put("resultCount", limited.size());
-        meta.put("totalMatchedBeforeLimit", rows.size());
+        meta.put("totalMatchedBeforeLimit", matchedRows.size());
 
         if (intent.groupBy() != null) {
             Map<String, Long> grouped = new LinkedHashMap<>();
-            for (AskPlanRowDto row : rows) {
+            for (AskPlanRowDto row : matchedRows) {
                 String key = resolveGroupKey(row, intent.groupBy());
                 grouped.merge(key, (long) sumMonths(row.baseValues(), periodMonths), Long::sum);
             }
@@ -244,7 +247,10 @@ public class AiAskPlanService {
         meta.put("isChart", false);
         meta.put("chartType", null);
 
-        String summary = buildSummary(intent, limited.size(), effectiveTopN);
+        boolean topNPerLineType = effectiveTopN != null
+                && intent.lineTypes() != null
+                && intent.lineTypes().size() > 1;
+        String summary = buildSummary(intent, limited.size(), effectiveTopN, topNPerLineType);
         return new AskPlanResponse(summary, intent.intent(), appliedFilters, limited, meta);
     }
 
@@ -390,12 +396,45 @@ public class AiAskPlanService {
         }
         PlanType type = parsePlanType(intent.comparePlanType()).orElse(PlanType.BUDGET);
         return planRepository
-                .findFirstByProperty_IdAndFiscalYearAndPlanTypeOrderByIdAsc(
-                        basePlan.getProperty().getId(), intent.comparePlanYear(), type)
+                .findFirstByProperty_IdAndFiscalYearAndPlanTypeAndStatusOrderByIdAsc(
+                        basePlan.getProperty().getId(), intent.comparePlanYear(), type, PlanStatus.ACTIVE)
                 .map(Plan::getId);
     }
 
+    private static String effectiveCoaCode(PlanMonthlyDetails li) {
+        return li.getCoaCode() != null && !li.getCoaCode().isBlank()
+                ? li.getCoaCode()
+                : li.getLineKey();
+    }
+
     // ── sorter / row building / actuals ─────────────────────────────────
+
+    /**
+     * When {@code topN} is set and multiple line types are filtered, returns up to {@code topN} rows
+     * per type (in line-types filter order). Otherwise applies a single global limit.
+     */
+    private static List<AskPlanRowDto> applyTopNLimit(
+            List<AskPlanRowDto> matchedRows,
+            ParsedAskIntent intent,
+            Comparator<AskPlanRowDto> rowComparator,
+            Integer effectiveTopN) {
+        if (effectiveTopN == null) {
+            return matchedRows.stream().sorted(rowComparator).toList();
+        }
+        List<String> lineTypes = intent.lineTypes();
+        if (lineTypes != null && lineTypes.size() > 1) {
+            List<AskPlanRowDto> out = new ArrayList<>();
+            for (String lineType : lineTypes) {
+                matchedRows.stream()
+                        .filter(r -> r.type().equalsIgnoreCase(lineType))
+                        .sorted(rowComparator)
+                        .limit(effectiveTopN)
+                        .forEach(out::add);
+            }
+            return out;
+        }
+        return matchedRows.stream().sorted(rowComparator).limit(effectiveTopN).toList();
+    }
 
     private Comparator<AskPlanRowDto> sorter(ParsedAskIntent intent) {
         List<String> months = monthsForPeriod(normalizePeriod(intent.period()));
@@ -546,7 +585,69 @@ public class AiAskPlanService {
         return matchesFilterExpression(li.getCategory(), category);
     }
 
+    private static final String DEPT_ALIAS_FB = "DEPT_FB";
+    private static final String DEPT_ALIAS_NON_OP = "DEPT_NON_OP";
+
+    private static boolean departmentFilterUsesAdvancedSyntax(String expression) {
+        if (expression == null) {
+            return false;
+        }
+        String e = expression.trim();
+        return e.startsWith("!") || e.startsWith("^") || e.startsWith("=") || e.contains("|");
+    }
+
+    /** Lowercase; & and - to spaces; collapse whitespace — for alias bucket detection only. */
+    static String normalizeDepartmentForAlias(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String s = raw.toLowerCase(Locale.ROOT).replace('&', ' ').replace('-', ' ');
+        return s.replaceAll("\\s+", " ").trim();
+    }
+
+    private static String collapseAlphaNum(String s) {
+        return s.replaceAll("[^a-z0-9]", "");
+    }
+
+    /**
+     * Canonical key when {@code raw} is a known department alias (F&amp;B family or non-operating); otherwise null.
+     */
+    static String resolveDepartmentAliasKey(String raw) {
+        String n = normalizeDepartmentForAlias(raw);
+        if (n.isEmpty()) {
+            return null;
+        }
+        if (n.contains("non operating")) {
+            return DEPT_ALIAS_NON_OP;
+        }
+        String collapsed = collapseAlphaNum(n);
+        if (collapsed.contains("nonoperating")) {
+            return DEPT_ALIAS_NON_OP;
+        }
+        if ("f b".equals(n) || "fandb".equals(n) || "fb".equals(n)) {
+            return DEPT_ALIAS_FB;
+        }
+        if (n.contains("food beverage") || n.contains("food and beverage")) {
+            return DEPT_ALIAS_FB;
+        }
+        if (n.contains("food department") || n.contains("food and department")) {
+            return DEPT_ALIAS_FB;
+        }
+        return null;
+    }
+
     private static boolean matchesDepartment(PlanMonthlyDetails li, String department) {
+        if (department == null || department.isBlank()) {
+            return true;
+        }
+        if (departmentFilterUsesAdvancedSyntax(department)) {
+            return matchesFilterExpression(li.getDepartment(), department);
+        }
+        String keyFilter = resolveDepartmentAliasKey(department);
+        String keyField = resolveDepartmentAliasKey(li.getDepartment());
+        if (keyFilter != null && keyFilter.equals(keyField)) {
+            return true;
+        }
         return matchesFilterExpression(li.getDepartment(), department);
     }
 
@@ -562,11 +663,40 @@ public class AiAskPlanService {
                 || matchesFilterExpression(li.getLabel(), coaName);
     }
 
+    /**
+     * Strips generic Ask Plan search noise (e.g. "department", "rows") so "show F&amp;B department rows"
+     * matches rows whose department is "F&amp;B".
+     */
+    private static String normalizeAskPlanSearchQuery(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return "";
+        }
+        String q = raw.trim().toLowerCase(Locale.ROOT);
+        String next;
+        do {
+            next = q.replaceAll(
+                            "\\b(department|departments|rows?|line\\s*items?|details?|for|from|in|the|all|my|show)\\b",
+                            " ")
+                    .replaceAll("\\s+", " ")
+                    .trim();
+            if (next.equals(q)) {
+                break;
+            }
+            q = next;
+        } while (true);
+        return q.isBlank() ? raw.trim().toLowerCase(Locale.ROOT) : q;
+    }
+
     private static boolean matchesSearchText(PlanMonthlyDetails li, String searchText) {
         if (searchText == null || searchText.isBlank()) {
             return true;
         }
-        String q = searchText.trim().toLowerCase(Locale.ROOT);
+        String q = normalizeAskPlanSearchQuery(searchText);
+        String keyQ = resolveDepartmentAliasKey(q);
+        String keyDept = resolveDepartmentAliasKey(li.getDepartment());
+        if (keyQ != null && keyQ.equals(keyDept)) {
+            return true;
+        }
         if (li.getLabel().toLowerCase(Locale.ROOT).contains(q)
                 || li.getLineKey().toLowerCase(Locale.ROOT).contains(q)
                 || li.getDepartment().toLowerCase(Locale.ROOT).contains(q)
@@ -595,7 +725,8 @@ public class AiAskPlanService {
         return Math.min(v, MAX_TOP_N);
     }
 
-    private static String buildSummary(ParsedAskIntent intent, int count, int topN) {
+    private static String buildSummary(
+            ParsedAskIntent intent, int count, Integer topN, boolean topNPerLineType) {
         String base;
         if ("compare_plan".equals(intent.intent())) {
             base = "Compared base plan with selected plan.";
@@ -608,7 +739,13 @@ public class AiAskPlanService {
         } else {
             base = "Analyzed line items for the requested question.";
         }
-        return base + " Returned " + count + " row(s), capped at top " + topN + ".";
+        if (topN != null) {
+            if (topNPerLineType) {
+                return base + " Returned " + count + " row(s), up to " + topN + " per line type.";
+            }
+            return base + " Returned " + count + " row(s), capped at top " + topN + ".";
+        }
+        return base + " Returned " + count + " row(s).";
     }
 
     // ── intent parsing ──────────────────────────────────────────────────
