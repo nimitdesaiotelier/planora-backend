@@ -49,5 +49,5 @@ public record AskPlanRequest(
         Integer queryPlanYear,
         /** BUDGET | FORECAST | WHAT_IF — pairs with queryPlanYear */
         String queryPlanType,
-        /** Optional aggregation: grand | department | category | type | coa_code | coa_name (overrides AI intent when set). */
+        /** Optional aggregation: grand | profit | department | category | type | coa_code | coa_name (overrides AI intent when set). */
         String groupBy) {}
