@@ -56,6 +56,8 @@ public class AiAskPlanService {
     /** Whole-word "total" / common typo "toal" for profit heuristic (avoid matching "totally"). */
     private static final Pattern WORD_TOTAL = Pattern.compile("\\btotal\\b", Pattern.CASE_INSENSITIVE);
     private static final Pattern WORD_TOAL = Pattern.compile("\\btoal\\b", Pattern.CASE_INSENSITIVE);
+    /** Whole-word "profit" (avoid matching "profitable", etc.). */
+    private static final Pattern WORD_PROFIT = Pattern.compile("\\bprofit\\b", Pattern.CASE_INSENSITIVE);
 
     private static String buildSystemPrompt() {
         int now = java.time.Year.now().getValue();
@@ -109,7 +111,7 @@ public class AiAskPlanService {
             + "  * grand (aliases: grand_total) - one total row over all matched lines after filters. Use for \"total revenue\" OR \"total expense\" alone, \"grand total\", \"sum of ...\", \"how much total\" (when not breaking down by a dimension).\n"
             + "  * department | category | type - one row per distinct value of that dimension.\n"
             + "  * coa_code - one row per COA / GL code; coa_name - one row per account name.\n"
-            + "  * profit (aliases: pnl, p_and_l, profit_loss) - Revenue in baseValues, Expense in compareValues; deltaVsCompare = revenue minus expense. Use for \"total revenue and expense\", P&amp;L, and \"revenue and expense by department\" (multiple profit rows). Use profit when the user asks which departments have expenses/costs greater than revenue (or similar); lineTypes must include both Revenue and Expense; compareMode none. Prefer profit over department when both revenue and expense appear with a department breakdown. compareMode must be none; do not combine with plan-vs-plan or plan-vs-actuals.\n"
+            + "  * profit (aliases: pnl, p_and_l, profit_loss) - REQUIRED whenever the user says \"profit\" (whole word) OR asks for \"revenue and expense\" by department OR total/plan revenue+expense together: Revenue in baseValues, Expense in compareValues; deltaVsCompare = revenue minus expense. One row per department when they ask by department. Do NOT use groupBy department for those — use profit (backend enforces this from the question text). lineTypes must include Revenue and Expense; compareMode none; no plan-vs-plan or plan-vs-actuals with profit.\n"
             + "  * null - return individual line items (no roll-up).\n"
             + "- totalFilter is ONLY for filtering lines by whether their plan sum is zero: any | zero | non_zero. Do NOT use totalFilter for questions that ask for a total dollar amount; use groupBy grand with the right lineTypes instead.\n"
             + "- Set chartType when user asks for a chart, graph, plot, or visualization. Use \"bar\" for comparisons, \"pie\" for proportions/shares, \"line\" for trends over time. Default to \"line\" if chart is requested but type is unclear.\n"
@@ -143,9 +145,10 @@ public class AiAskPlanService {
     public AskPlanResponse ask(AskPlanRequest req) {
         ParsedAskIntent aiIntent = parseIntent(req.provider(), req.question());
         ParsedAskIntent intent = applyFoodAndUtilitiesCombinedDepartmentHeuristic(
-                applyExpenseGreaterThanRevenueProfitHeuristic(
+                applyProfitGroupByHeuristic(
                         resolveRelativeYearsIfMissing(mergeWithOverrides(aiIntent, req), req.question()),
-                        req.question()),
+                        req.question(),
+                        req.groupBy()),
                 req.question());
 
         Plan anchorPlan = planRepository.findById(req.basePlanId())
@@ -551,8 +554,7 @@ public class AiAskPlanService {
         if ("profit".equals(effectiveGroupBy)) {
             String q = question == null ? "" : question.toLowerCase(Locale.ROOT);
             boolean filterExpenseGreaterThanRevenue = expenseComparedAboveRevenue(q);
-            boolean perDepartment = wantsProfitByDepartmentBreakdown(question)
-                    || (filterExpenseGreaterThanRevenue && questionReferencesDepartment(q));
+            boolean perDepartment = profitBreakdownPerDepartment(question, intent, filterExpenseGreaterThanRevenue);
             if (perDepartment) {
                 Map<String, List<AskPlanRowDto>> byDept = new LinkedHashMap<>();
                 for (AskPlanRowDto row : matchedRows) {
@@ -642,6 +644,46 @@ public class AiAskPlanService {
                 || s.contains("department-wise")
                 || s.contains("for each department")
                 || s.contains("each department");
+    }
+
+    /** True when the question names both revenue and expense and a department dimension (profit rows per dept). */
+    private static boolean questionHasRevenueExpenseAndDepartmentBreakdown(String question) {
+        if (question == null || question.isBlank()) {
+            return false;
+        }
+        String s = question.toLowerCase(Locale.ROOT);
+        if (!s.contains("revenue") || !s.contains("expense")) {
+            return false;
+        }
+        return s.contains("by department")
+                || s.contains("per department")
+                || s.contains("department-wise")
+                || s.contains("for each department")
+                || s.contains("each department");
+    }
+
+    /**
+     * Whether profit results should be split one synthetic row per department (vs one global profit row).
+     */
+    private static boolean profitBreakdownPerDepartment(
+            String question, ParsedAskIntent intent, boolean filterExpenseGreaterThanRevenue) {
+        String q = question == null ? "" : question.toLowerCase(Locale.ROOT);
+        if (questionHasRevenueExpenseAndDepartmentBreakdown(question)) {
+            return true;
+        }
+        if (filterExpenseGreaterThanRevenue && questionReferencesDepartment(q)) {
+            return true;
+        }
+        if (!wantsProfitByDepartmentBreakdown(question)) {
+            return false;
+        }
+        List<String> lt = intent.lineTypes();
+        if (lt == null || lt.isEmpty()) {
+            return q.contains("revenue") && q.contains("expense");
+        }
+        boolean hasRev = lt.stream().anyMatch(t -> "Revenue".equalsIgnoreCase(t));
+        boolean hasExp = lt.stream().anyMatch(t -> "Expense".equalsIgnoreCase(t));
+        return hasRev && hasExp;
     }
 
     /**
@@ -758,16 +800,20 @@ public class AiAskPlanService {
     }
 
     /**
-     * When the question asks for expense &gt; revenue, force profit semantics (Revenue + Expense line types,
-     * groupBy profit) so results match other profit queries even if the model chose department or grand.
+     * Forces {@code groupBy: profit} (revenue → baseValues, expense → compareValues) when the question clearly
+     * asks for profit / P&amp;L / revenue+expense together / revenue+expense by department / expense &gt; revenue,
+     * overriding wrong model values such as department or grand. Respects an explicit {@code groupBy} on the API
+     * request.
      */
-    private static ParsedAskIntent applyExpenseGreaterThanRevenueProfitHeuristic(
-            ParsedAskIntent intent, String question) {
+    private static ParsedAskIntent applyProfitGroupByHeuristic(
+            ParsedAskIntent intent, String question, String requestGroupByOverride) {
+        if (requestGroupByOverride != null && !requestGroupByOverride.isBlank()) {
+            return intent;
+        }
         if (question == null || question.isBlank()) {
             return intent;
         }
-        String s = question.toLowerCase(Locale.ROOT);
-        if (!expenseComparedAboveRevenue(s)) {
+        if (!questionRequiresProfitGroupBy(question)) {
             return intent;
         }
         LinkedHashSet<String> lt = new LinkedHashSet<>();
@@ -776,11 +822,6 @@ public class AiAskPlanService {
         }
         lt.add("Revenue");
         lt.add("Expense");
-        String ng = normalizeGroupBy(intent.groupBy());
-        String newGroupBy = intent.groupBy();
-        if (ng == null || "department".equals(ng) || "grand".equals(ng)) {
-            newGroupBy = "profit";
-        }
         return new ParsedAskIntent(
                 intent.intent(),
                 List.copyOf(lt),
@@ -801,8 +842,35 @@ public class AiAskPlanService {
                 intent.queryPlanType(),
                 intent.totalFilter(),
                 intent.totalFilterMonths(),
-                newGroupBy,
+                "profit",
                 intent.chartType());
+    }
+
+    private static boolean questionRequiresProfitGroupBy(String question) {
+        String s = question.toLowerCase(Locale.ROOT);
+        if (expenseComparedAboveRevenue(s)) {
+            return true;
+        }
+        if (WORD_PROFIT.matcher(s).find()) {
+            return true;
+        }
+        if (s.contains("net income")
+                || s.contains("bottom line")
+                || s.contains("profit and loss")
+                || s.contains("p&l")
+                || s.contains("p & l")
+                || s.contains("p/l")) {
+            return true;
+        }
+        if (s.contains("revenue") && s.contains("expense")) {
+            if (questionHasRevenueExpenseAndDepartmentBreakdown(question)) {
+                return true;
+            }
+            if (WORD_TOTAL.matcher(s).find() || WORD_TOAL.matcher(s).find()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
