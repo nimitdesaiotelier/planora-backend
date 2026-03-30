@@ -47,6 +47,9 @@ public class AiAskPlanService {
     private static final int DEFAULT_TOP_N = 25;
     private static final int MAX_TOP_N = 100;
 
+    /** Display / merge key when a grouping dimension is null or blank on a line. */
+    private static final String GROUP_KEY_NONE = "(none)";
+
     private static final Pattern COMPARE_WORDS = Pattern.compile(
             "\\b(compare|vs\\.?|versus|against)\\b", Pattern.CASE_INSENSITIVE);
 
@@ -74,7 +77,7 @@ public class AiAskPlanService {
             + "  \"queryPlanYear\":number or null,\n"
             + "  \"queryPlanType\":\"BUDGET|FORECAST|WHAT_IF|null\",\n"
             + "  \"totalFilter\":\"any|zero|non_zero|null\",\n"
-            + "  \"groupBy\":\"department|category|type|null\",\n"
+            + "  \"groupBy\":\"grand|department|category|type|coa_code|coa_name|null\",\n"
             + "  \"chartType\":\"bar|pie|line|null\"\n"
             + "}\n"
             + "Rules:\n"
@@ -92,7 +95,12 @@ public class AiAskPlanService {
             + "- Use compare_actuals for plan-vs-actual requests.\n"
             + "- Use top_n when user asks for top/bottom style ranking.\n"
             + "- Use filter when user asks for constrained subsets (by category/type/text).\n"
-            + "- Use groupBy when user asks for totals/breakdown by department, category, or account type.\n"
+            + "- groupBy controls row aggregation (rolled-up result rows), not zero filtering:\n"
+            + "  * grand (aliases: grand_total) - one total row over all matched lines after filters. Use for \"total revenue\", \"total expense\", \"grand total\", \"sum of ...\", \"how much total\" (when not breaking down by a dimension).\n"
+            + "  * department | category | type - one row per distinct value of that dimension.\n"
+            + "  * coa_code - one row per COA / GL code; coa_name - one row per account name.\n"
+            + "  * null - return individual line items (no roll-up).\n"
+            + "- totalFilter is ONLY for filtering lines by whether their plan sum is zero: any | zero | non_zero. Do NOT use totalFilter for questions that ask for a total dollar amount; use groupBy grand with the right lineTypes instead.\n"
             + "- Set chartType when user asks for a chart, graph, plot, or visualization. Use \"bar\" for comparisons, \"pie\" for proportions/shares, \"line\" for trends over time. Default to \"line\" if chart is requested but type is unclear.\n"
             + "- If unclear, use unknown.\n"
             + "Respond with valid JSON only.";
@@ -134,6 +142,7 @@ public class AiAskPlanService {
         }
 
         if ("unknown".equals(intent.intent())
+                && normalizeGroupBy(intent.groupBy()) == null
                 && intent.topN() == null
                 && (intent.lineTypes() == null || intent.lineTypes().isEmpty())
                 && intent.category() == null
@@ -200,9 +209,15 @@ public class AiAskPlanService {
                         intent.totalFilterMonths(), intent.period()))
                 .toList();
 
+        String effectiveGroupBy = normalizeGroupBy(intent.groupBy());
+        List<AskPlanRowDto> rowsForLimit = buildResultRowsAfterGrouping(
+                matchedRows, effectiveGroupBy, intent, periodMonths, isFullYear);
+
         Comparator<AskPlanRowDto> rowComparator = sorter(intent);
         Integer effectiveTopN = intent.topN() != null ? clampTopN(intent.topN()) : null;
-        List<AskPlanRowDto> limited = applyTopNLimit(matchedRows, intent, rowComparator, effectiveTopN);
+        boolean aggregated = effectiveGroupBy != null;
+        List<AskPlanRowDto> limited =
+                applyTopNLimit(rowsForLimit, intent, rowComparator, effectiveTopN, aggregated);
 
         Map<String, Object> appliedFilters = new LinkedHashMap<>();
         appliedFilters.put("period", normalizePeriod(intent.period()));
@@ -223,7 +238,7 @@ public class AiAskPlanService {
         appliedFilters.put("queryPlanType", intent.queryPlanType());
         appliedFilters.put("totalFilter", intent.totalFilter());
         appliedFilters.put("totalFilterMonths", intent.totalFilterMonths());
-        appliedFilters.put("groupBy", intent.groupBy());
+        appliedFilters.put("groupBy", effectiveGroupBy);
 
         Map<String, Object> meta = new LinkedHashMap<>();
         meta.put("basePlanId", basePlan.getId());
@@ -233,14 +248,14 @@ public class AiAskPlanService {
         meta.put("resultCount", limited.size());
         meta.put("totalMatchedBeforeLimit", matchedRows.size());
 
-        if (intent.groupBy() != null) {
+        if (effectiveGroupBy != null) {
             Map<String, Long> grouped = new LinkedHashMap<>();
             for (AskPlanRowDto row : matchedRows) {
-                String key = resolveGroupKey(row, intent.groupBy());
+                String key = resolveGroupKey(row, effectiveGroupBy);
                 grouped.merge(key, (long) sumMonths(row.baseValues(), periodMonths), Long::sum);
             }
             meta.put("groupedTotals", grouped);
-            meta.put("groupBy", intent.groupBy());
+            meta.put("groupBy", effectiveGroupBy);
         }
 
         // TODO: re-enable chart support after improving AI prompt accuracy
@@ -248,6 +263,7 @@ public class AiAskPlanService {
         meta.put("chartType", null);
 
         boolean topNPerLineType = effectiveTopN != null
+                && !aggregated
                 && intent.lineTypes() != null
                 && intent.lineTypes().size() > 1;
         String summary = buildSummary(intent, limited.size(), effectiveTopN, topNPerLineType);
@@ -417,12 +433,13 @@ public class AiAskPlanService {
             List<AskPlanRowDto> matchedRows,
             ParsedAskIntent intent,
             Comparator<AskPlanRowDto> rowComparator,
-            Integer effectiveTopN) {
+            Integer effectiveTopN,
+            boolean aggregated) {
         if (effectiveTopN == null) {
             return matchedRows.stream().sorted(rowComparator).toList();
         }
         List<String> lineTypes = intent.lineTypes();
-        if (lineTypes != null && lineTypes.size() > 1) {
+        if (!aggregated && lineTypes != null && lineTypes.size() > 1) {
             List<AskPlanRowDto> out = new ArrayList<>();
             for (String lineType : lineTypes) {
                 matchedRows.stream()
@@ -434,6 +451,174 @@ public class AiAskPlanService {
             return out;
         }
         return matchedRows.stream().sorted(rowComparator).limit(effectiveTopN).toList();
+    }
+
+    /**
+     * After filters, either pass detail rows through or build one row per group / grand total.
+     */
+    private static List<AskPlanRowDto> buildResultRowsAfterGrouping(
+            List<AskPlanRowDto> matchedRows,
+            String effectiveGroupBy,
+            ParsedAskIntent intent,
+            List<String> periodMonths,
+            boolean isFullYear) {
+        if (effectiveGroupBy == null) {
+            return matchedRows;
+        }
+        if (matchedRows.isEmpty()) {
+            return List.of();
+        }
+        if ("grand".equals(effectiveGroupBy)) {
+            String label = grandTotalLabel(intent);
+            return List.of(aggregateAskPlanRows(
+                    matchedRows,
+                    "__grand__",
+                    label,
+                    null,
+                    null,
+                    null,
+                    mergedLineType(matchedRows),
+                    null,
+                    isFullYear ? null : periodMonths));
+        }
+        Map<String, List<AskPlanRowDto>> buckets = new LinkedHashMap<>();
+        for (AskPlanRowDto row : matchedRows) {
+            String key = resolveGroupKey(row, effectiveGroupBy);
+            buckets.computeIfAbsent(key, k -> new ArrayList<>()).add(row);
+        }
+        List<AskPlanRowDto> out = new ArrayList<>();
+        for (Map.Entry<String, List<AskPlanRowDto>> e : buckets.entrySet()) {
+            out.add(buildSyntheticGroupRow(e.getKey(), e.getValue(), effectiveGroupBy, isFullYear ? null : periodMonths));
+        }
+        return out;
+    }
+
+    private static AskPlanRowDto buildSyntheticGroupRow(
+            String groupKey,
+            List<AskPlanRowDto> rows,
+            String groupBy,
+            List<String> periodMonths) {
+        String lineKey = syntheticLineKey(groupBy, groupKey);
+        String label = groupKey;
+        String department = null;
+        String coaCode = null;
+        String coaName = null;
+        String category = null;
+        String type = null;
+        if ("department".equals(groupBy)) {
+            department = groupKey;
+        } else if ("category".equals(groupBy)) {
+            category = groupKey;
+        } else if ("type".equals(groupBy)) {
+            type = groupKey;
+        } else if ("coa_code".equals(groupBy)) {
+            coaCode = groupKey;
+        } else if ("coa_name".equals(groupBy)) {
+            coaName = groupKey;
+        }
+        if (!"type".equals(groupBy)) {
+            type = mergedLineType(rows);
+        }
+        return aggregateAskPlanRows(rows, lineKey, label, department, coaCode, coaName, type, category, periodMonths);
+    }
+
+    private static String grandTotalLabel(ParsedAskIntent intent) {
+        List<String> lt = intent.lineTypes();
+        if (lt != null && lt.size() == 1) {
+            return "Total - " + lt.get(0);
+        }
+        return "Grand total";
+    }
+
+    private static String syntheticLineKey(String groupBy, String groupKey) {
+        String safe = groupKey == null ? GROUP_KEY_NONE : groupKey.replace(':', '_');
+        return "__group__:" + groupBy + ":" + safe;
+    }
+
+    private static String mergedLineType(List<AskPlanRowDto> rows) {
+        Set<String> types = new LinkedHashSet<>();
+        for (AskPlanRowDto r : rows) {
+            if (r.type() != null && !r.type().isBlank()) {
+                types.add(r.type());
+            }
+        }
+        if (types.isEmpty()) {
+            return null;
+        }
+        if (types.size() == 1) {
+            return types.iterator().next();
+        }
+        return "Mixed";
+    }
+
+    private static Map<String, Integer> mergeMonthValueMaps(List<Map<String, Integer>> maps) {
+        Map<String, Integer> out = new LinkedHashMap<>();
+        for (Map<String, Integer> m : maps) {
+            if (m == null) {
+                continue;
+            }
+            for (Map.Entry<String, Integer> e : m.entrySet()) {
+                out.merge(e.getKey(), e.getValue() != null ? e.getValue() : 0, Integer::sum);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Sums monthly maps and totals; compare/actual fields are null unless every row in the group has that side.
+     */
+    private static AskPlanRowDto aggregateAskPlanRows(
+            List<AskPlanRowDto> rows,
+            String lineKey,
+            String label,
+            String department,
+            String coaCode,
+            String coaName,
+            String type,
+            String category,
+            List<String> periodMonths) {
+        List<Map<String, Integer>> baseMaps = rows.stream().map(AskPlanRowDto::baseValues).toList();
+        Map<String, Integer> baseValues = mergeMonthValueMaps(baseMaps);
+
+        boolean allCompare = !rows.isEmpty() && rows.stream().allMatch(r -> r.compareValues() != null);
+        Map<String, Integer> compareValues =
+                allCompare ? mergeMonthValueMaps(rows.stream().map(AskPlanRowDto::compareValues).toList()) : null;
+
+        boolean allActual = !rows.isEmpty() && rows.stream().allMatch(r -> r.actualValues() != null);
+        Map<String, Integer> actualValues =
+                allActual ? mergeMonthValueMaps(rows.stream().map(AskPlanRowDto::actualValues).toList()) : null;
+
+        Integer baseTotal = sumMonths(baseValues, PlanMonthlyDetails.MONTH_KEYS);
+        Integer compareTotal = compareValues == null ? null : sumMonths(compareValues, PlanMonthlyDetails.MONTH_KEYS);
+        Integer actualTotal = actualValues == null ? null : sumMonths(actualValues, PlanMonthlyDetails.MONTH_KEYS);
+        Integer deltaVsCompare = compareTotal == null ? null : (baseTotal - compareTotal);
+        Integer deltaVsActual = actualTotal == null ? null : (baseTotal - actualTotal);
+
+        Integer periodTotal = periodMonths != null ? sumMonths(baseValues, periodMonths) : null;
+        Integer comparePeriodTotal =
+                periodMonths != null && compareValues != null ? sumMonths(compareValues, periodMonths) : null;
+        Integer actualPeriodTotal =
+                periodMonths != null && actualValues != null ? sumMonths(actualValues, periodMonths) : null;
+
+        return new AskPlanRowDto(
+                lineKey,
+                department,
+                coaCode,
+                coaName,
+                label,
+                type,
+                category,
+                baseValues,
+                baseTotal,
+                periodTotal,
+                compareValues,
+                compareTotal,
+                comparePeriodTotal,
+                deltaVsCompare,
+                actualValues,
+                actualTotal,
+                actualPeriodTotal,
+                deltaVsActual);
     }
 
     private Comparator<AskPlanRowDto> sorter(ParsedAskIntent intent) {
@@ -1004,7 +1189,7 @@ public class AiAskPlanService {
         Integer queryPlanYear = intVal(n, "queryPlanYear");
         String queryPlanType = text(n, "queryPlanType");
         String totalFilter = text(n, "totalFilter");
-        String groupBy = text(n, "groupBy");
+        String groupBy = normalizeGroupBy(blankToNull(text(n, "groupBy")));
         String chartType = text(n, "chartType");
         return new ParsedAskIntent(
                 blankToNull(intent),
@@ -1026,7 +1211,7 @@ public class AiAskPlanService {
                 normalizePlanType(queryPlanType),
                 blankToNull(totalFilter),
                 null,
-                blankToNull(groupBy),
+                groupBy,
                 normalizeChartType(blankToNull(chartType)));
     }
 
@@ -1121,7 +1306,7 @@ public class AiAskPlanService {
             }
         }
 
-        String groupBy = inferGroupBy(s);
+        String groupBy = normalizeGroupBy(inferGroupBy(s));
 
         String chartType = null;
         if (s.contains("chart") || s.contains("graph") || s.contains("plot") || s.contains("visuali")) {
@@ -1217,13 +1402,87 @@ public class AiAskPlanService {
     }
 
     private static String inferGroupBy(String s) {
-        if (s == null) return null;
-        if (s.contains("by department") || s.contains("department-wise")
-                || s.contains("per department")) return "department";
-        if (s.contains("by category") || s.contains("category-wise")
-                || s.contains("per category")) return "category";
-        if (s.contains("by type") || s.contains("type-wise")
-                || s.contains("per type") || s.contains("by account type")) return "type";
+        if (s == null) {
+            return null;
+        }
+        if (s.contains("by department")
+                || s.contains("department-wise")
+                || s.contains("per department")) {
+            return "department";
+        }
+        if (s.contains("by category")
+                || s.contains("category-wise")
+                || s.contains("per category")) {
+            return "category";
+        }
+        if (s.contains("by type")
+                || s.contains("type-wise")
+                || s.contains("per type")
+                || s.contains("by account type")) {
+            return "type";
+        }
+        if (s.contains("by coa name")
+                || s.contains("by account name")
+                || s.contains("per coa name")
+                || s.contains("per account name")
+                || s.contains("by gl name")) {
+            return "coa_name";
+        }
+        if (s.contains("by coa")
+                || s.contains("by gl")
+                || s.contains("per coa")
+                || s.contains("by account code")
+                || s.contains("by gl code")) {
+            return "coa_code";
+        }
+        if (s.contains("grand total") || s.contains("grand_total")) {
+            return "grand";
+        }
+        if (s.contains("total revenue")
+                || s.contains("total expenses")
+                || s.contains("total expense")
+                || s.contains("total statistics")
+                || s.contains("sum of ")
+                || s.contains("sum of the ")
+                || s.contains("what's the total")
+                || s.contains("what is the total")
+                || s.contains("how much total")) {
+            return "grand";
+        }
+        return null;
+    }
+
+    /**
+     * Canonical aggregation dimension; unknown or empty tokens yield null (keep detail rows).
+     */
+    static String normalizeGroupBy(String raw) {
+        if (raw == null || raw.isBlank() || "null".equalsIgnoreCase(raw.trim())) {
+            return null;
+        }
+        String compact = raw.trim().toLowerCase(Locale.ROOT).replace('-', '_').replace(" ", "");
+        if ("grand".equals(compact) || "grand_total".equals(compact) || "grandtotal".equals(compact)) {
+            return "grand";
+        }
+        if ("coa_code".equals(compact) || "coacode".equals(compact)) {
+            return "coa_code";
+        }
+        if ("coa_name".equals(compact)
+                || "coaname".equals(compact)
+                || "account_name".equals(compact)
+                || "accountname".equals(compact)) {
+            return "coa_name";
+        }
+        if ("department".equals(compact) || "dept".equals(compact)) {
+            return "department";
+        }
+        if ("category".equals(compact)) {
+            return "category";
+        }
+        if ("type".equals(compact)
+                || "account_type".equals(compact)
+                || "accounttype".equals(compact)) {
+            return "type";
+        }
         return null;
     }
 
@@ -1291,11 +1550,33 @@ public class AiAskPlanService {
         return "zero".equalsIgnoreCase(totalFilter) ? sum == 0 : sum != 0;
     }
 
+    private static String nullSafeGroupKey(String v) {
+        return (v == null || v.isBlank()) ? GROUP_KEY_NONE : v;
+    }
+
     private static String resolveGroupKey(AskPlanRowDto row, String groupBy) {
-        if ("department".equals(groupBy)) return row.department();
-        if ("category".equals(groupBy)) return row.category();
-        if ("type".equals(groupBy)) return row.type();
-        return "other";
+        if (groupBy == null) {
+            return GROUP_KEY_NONE;
+        }
+        if ("grand".equals(groupBy)) {
+            return "__grand__";
+        }
+        if ("department".equals(groupBy)) {
+            return nullSafeGroupKey(row.department());
+        }
+        if ("category".equals(groupBy)) {
+            return nullSafeGroupKey(row.category());
+        }
+        if ("type".equals(groupBy)) {
+            return nullSafeGroupKey(row.type());
+        }
+        if ("coa_code".equals(groupBy)) {
+            return nullSafeGroupKey(row.coaCode());
+        }
+        if ("coa_name".equals(groupBy)) {
+            return nullSafeGroupKey(row.coaName() != null && !row.coaName().isBlank() ? row.coaName() : row.label());
+        }
+        return GROUP_KEY_NONE;
     }
 
     private static String inferPlanTypeFromKeywords(String s) {
@@ -1372,7 +1653,7 @@ public class AiAskPlanService {
                 coalesce(blankToNull(req.totalFilter()), ai.totalFilter()),
                 req.totalFilterMonths() != null && !req.totalFilterMonths().isEmpty()
                         ? req.totalFilterMonths() : ai.totalFilterMonths(),
-                ai.groupBy(),
+                normalizeGroupBy(coalesce(blankToNull(req.groupBy()), ai.groupBy())),
                 ai.chartType());
     }
 
