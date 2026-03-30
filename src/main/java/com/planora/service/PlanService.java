@@ -249,6 +249,11 @@ public class PlanService {
                 throw new IllegalArgumentException("values are required when dailyDetails is omitted");
             }
             item.applyValuesMap(body.values());
+            Map<String, List<Integer>> regeneratedDaily = dailyDetailsSplitService.buildDailyFromMonthly(
+                    item.toValuesMap(),
+                    plan.getFiscalYear(),
+                    item.getType());
+            item.applyDailyDetailsMap(regeneratedDaily);
         }
         PlanMonthlyDetails saved = lineItemRepository.save(item);
         ActualsDetails ad = actualsDetailRepository
