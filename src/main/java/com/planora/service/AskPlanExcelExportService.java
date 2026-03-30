@@ -82,7 +82,6 @@ public class AskPlanExcelExportService {
         Optional<Plan> planOpt = resolvePlanForHeader(response);
 
         try (XSSFWorkbook wb = new XSSFWorkbook()) {
-            boolean includeChart = Boolean.TRUE.equals(request.includeChart());
             DataFormat dataFormat = wb.createDataFormat();
             TableStyles tableStyles = createTableStyles(wb, dataFormat);
 
@@ -135,24 +134,14 @@ public class AskPlanExcelExportService {
 
             autoSizeColumnsWithLimits(sheet, headerCols);
 
-            if (includeChart && !rows.isEmpty()) {
-                AskPlanExcelChart.addMonthlyLineChartPerLineItem(
-                        sheet, useBaseActualMonthLayout(flags), dataStart, rows, totalRowIndex);
-            }
-
             List<String> analysisPoints = request.analysisPoints();
             if (analysisPoints != null && !analysisPoints.isEmpty()) {
-                int analysisStartRow;
-                if (includeChart && !rows.isEmpty()) {
-                    analysisStartRow = AskPlanExcelChart.firstRowBelowMonthlyChart(totalRowIndex);
-                } else {
-                    analysisStartRow = totalRowIndex + 2;
-                }
+                int analysisStartRow = totalRowIndex + 2;
                 writeAnalysisSection(sheet, wb, analysisStartRow, analysisPoints, headerCols);
             }
 
             byte[] bytes = toBytes(wb);
-            String filename = resolveFilename(planOpt, includeChart);
+            String filename = resolveFilename(planOpt);
             return new AskPlanExcelExportResult(bytes, filename);
         }
     }
@@ -299,14 +288,13 @@ public class AskPlanExcelExportService {
         };
     }
 
-    private static String resolveFilename(Optional<Plan> planOpt, boolean includeChart) {
-        String suffix = includeChart ? "-chart" : "";
+    private static String resolveFilename(Optional<Plan> planOpt) {
         if (planOpt.isEmpty()) {
-            return "ask-plan-export" + suffix + ".xlsx";
+            return "ask-plan-export.xlsx";
         }
         Plan p = planOpt.get();
         String raw = p.getName() != null && !p.getName().isBlank() ? p.getName() : "plan-" + p.getId();
-        return sanitizeFilenameBase(raw) + suffix + ".xlsx";
+        return sanitizeFilenameBase(raw) + ".xlsx";
     }
 
     /**
