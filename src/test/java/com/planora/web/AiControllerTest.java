@@ -110,7 +110,7 @@ class AiControllerTest {
 
         AskPlanResponse resp = new AskPlanResponse(
                 "summary", "filter", Map.of("compareMode", "none"), List.of(), Map.of("resultCount", 0));
-        AskPlanExcelExportRequest exportBody = new AskPlanExcelExportRequest(resp, null, null, null, null, false, null);
+        AskPlanExcelExportRequest exportBody = new AskPlanExcelExportRequest(resp, null, null, null, null, null);
 
         mockMvc.perform(post("/api/ai/ask-plan/export-xlsx")
                         .contentType(MediaType.APPLICATION_JSON)

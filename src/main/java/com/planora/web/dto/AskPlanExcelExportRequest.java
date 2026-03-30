@@ -1,5 +1,6 @@
 package com.planora.web.dto;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import java.util.List;
 
@@ -9,13 +10,12 @@ import java.util.List;
  * the plan cannot be loaded (e.g. tests).
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
+@JsonIgnoreProperties(ignoreUnknown = true)
 public record AskPlanExcelExportRequest(
         AskPlanResponse response,
         String planHeadline,
         String planTypeLabel,
         String fiscalYearLabel,
         String propertyName,
-        /** When true, the workbook includes a line chart (months on X, totals on Y). */
-        Boolean includeChart,
-        /** Optional AI analysis bullets (same as Ask Plan UI); placed after chart if present, else after the table. */
+        /** Optional AI analysis bullets (same as Ask Plan UI); placed below the data table. */
         List<String> analysisPoints) {}
